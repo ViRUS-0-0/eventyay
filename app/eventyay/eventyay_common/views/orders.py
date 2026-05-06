@@ -15,12 +15,17 @@ class MyOrdersView(ListView):
     template_name = 'eventyay_common/orders/orders.html'
     paginate_by = 20
 
+    def _get_filter_form(self):
+        if not hasattr(self, '_filter_form'):
+            self._filter_form = UserOrderFilterForm(self.request.GET, user=self.request.user)
+        return self._filter_form
+
     def get_queryset(self):
         user = self.request.user
         qs = Order.objects.filter(Q(email__iexact=user.email)).select_related('event').order_by('-datetime')
 
         # Filter by event if provided
-        filter_form = UserOrderFilterForm(self.request.GET, user=user)
+        filter_form = self._get_filter_form()
         if filter_form.is_valid():
             event = filter_form.cleaned_data['event']
             if event:
@@ -30,16 +35,31 @@ class MyOrdersView(ListView):
 
     def get_context_data(self, **kwargs):
         ctx = super().get_context_data(**kwargs)
-        ctx['filter_form'] = UserOrderFilterForm(self.request.GET, user=self.request.user)
+        ctx['filter_form'] = self._get_filter_form()
         return ctx
 
+    def _is_ajax(self, request):
+        return request.headers.get('X-Requested-With') == 'XMLHttpRequest'
+
     def get(self, request, *args, **kwargs):
-        filter_form = UserOrderFilterForm(self.request.GET, user=self.request.user)
-        # If filter form is invalid, strip the 'event' from URL and redirect to this new URL.
+        filter_form = self._get_filter_form()
+        is_ajax = self._is_ajax(request)
+
+        # If filter form is invalid, strip the 'event' param.
         if not filter_form.is_valid():
-            new_url_query = request.GET.copy()
-            new_url_query.pop('event', None)
-            new_url = request.path + '?' + new_url_query.urlencode()
-            logger.info('To redirect to "%s" because the filter values are invalid.', new_url)
-            return redirect(new_url)
+            if is_ajax:
+                # Re-initialize form with cleaned params instead of mutating request.GET.
+                cleaned_params = request.GET.copy()
+                cleaned_params.pop('event', None)
+                self._filter_form = UserOrderFilterForm(cleaned_params, user=request.user)
+            else:
+                new_url_query = request.GET.copy()
+                new_url_query.pop('event', None)
+                new_url = request.path + '?' + new_url_query.urlencode()
+                logger.info('To redirect to "%s" because the filter values are invalid.', new_url)
+                return redirect(new_url)
+
+        if is_ajax:
+            self.template_name = 'eventyay_common/orders/orders_table.html'
+
         return super().get(request, *args, **kwargs)
