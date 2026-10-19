@@ -58,16 +58,19 @@
         </div>
     </div>
 
-    <form action="" method="post" class="form-horizontal">
+    <form action="{% url "control:event.vouchers.bulk_edit" organizer=request.event.organizer.slug event=request.event.slug %}" method="post" class="form-horizontal">
         {% csrf_token %}
         {% for key, values in post_data.lists %}
-            {% if key != 'csrfmiddlewaretoken' and key != 'action' %}
+            {% if key != 'csrfmiddlewaretoken' and key != 'action' and key != 'original_tag' %}
                 {% for val in values %}
                     <input type="hidden" name="{{ key }}" value="{{ val }}">
                 {% endfor %}
             {% endif %}
         {% endfor %}
 
+        {% if target_tag %}
+            <input type="hidden" name="original_tag" value="{{ target_tag }}">
+        {% endif %}
         <div class="form-group submit-group">
             <button type="submit" class="btn btn-default" name="action" value="edit">
                 {% trans "Back" %}

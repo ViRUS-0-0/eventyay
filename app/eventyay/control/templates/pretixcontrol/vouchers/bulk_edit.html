@@ -22,7 +22,7 @@
         </p>
     </div>
 
-    <form action="" method="post" class="form-horizontal" data-voucher-bulk-form>
+    <form action="{% url "control:event.vouchers.bulk_edit" organizer=request.event.organizer.slug event=request.event.slug %}" method="post" class="form-horizontal" data-voucher-bulk-form>
         {% csrf_token %}
         {% bootstrap_form_errors form %}
 
@@ -32,8 +32,8 @@
         {% for pk in voucher_pks %}
             <input type="hidden" name="voucher" value="{{ pk }}">
         {% endfor %}
-        {% if tag %}
-            <input type="hidden" name="tag" value="{{ tag }}">
+        {% if target_tag %}
+            <input type="hidden" name="target_tag" value="{{ target_tag }}">
         {% endif %}
 
         <fieldset>

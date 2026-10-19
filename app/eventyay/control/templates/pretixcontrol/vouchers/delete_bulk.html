@@ -7,6 +7,7 @@
     <form action="" method="post" class="form-horizontal">
         {% csrf_token %}
         {% if tag %}
+            <input type="hidden" name="original_tag" value="{{ tag }}">
             <p>{% blocktrans with name=tag %}Are you sure you want to delete the voucher group <strong>{{ name }}</strong>?{% endblocktrans %}</p>
             <ul>
                 <li>

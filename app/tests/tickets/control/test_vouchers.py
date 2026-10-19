@@ -1008,14 +1008,14 @@ class VoucherFilterEmptyStateTest(SoupTestMixin, TestCase):
             v_unused = self.event.vouchers.create(
                 product=self.ticket, code='VOL_U', tag='volunteers', max_usages=1, redeemed=0
             )
-            v_partly = self.event.vouchers.create(
+            self.event.vouchers.create(
                 product=self.ticket, code='VOL_P', tag='volunteers', max_usages=5, redeemed=2
             )
-            v_fully = self.event.vouchers.create(
+            self.event.vouchers.create(
                 product=self.ticket, code='VOL_F', tag='volunteers', max_usages=2, redeemed=2
             )
         response = self.client.post(
-            '/control/event/%s/%s/vouchers/bulk_edit' % (self.orga.slug, self.event.slug),
+            f'/control/event/{self.orga.slug}/{self.event.slug}/vouchers/bulk_edit',
             {
                 'action': 'save',
                 'voucher_group': [v_unused.pk],
@@ -1044,7 +1044,7 @@ class VoucherFilterEmptyStateTest(SoupTestMixin, TestCase):
                 product=self.ticket, code='VOL_F2', tag='volunteers2', max_usages=2, redeemed=2
             )
         response = self.client.post(
-            '/control/event/%s/%s/vouchers/bulk_edit' % (self.orga.slug, self.event.slug),
+            f'/control/event/{self.orga.slug}/{self.event.slug}/vouchers/bulk_edit',
             {
                 'action': 'save_confirm',
                 'voucher_group': [v_unused.pk],
@@ -1072,11 +1072,11 @@ class VoucherFilterEmptyStateTest(SoupTestMixin, TestCase):
     def test_voucher_group_delete_get_and_post(self):
         with scopes_disabled():
             v1 = self.event.vouchers.create(product=self.ticket, code='DEL1', tag='del-group', redeemed=0)
-            v2 = self.event.vouchers.create(product=self.ticket, code='DEL2', tag='del-group', redeemed=0)
-            v3 = self.event.vouchers.create(product=self.ticket, code='DEL3', tag='del-group', redeemed=1)
+            self.event.vouchers.create(product=self.ticket, code='DEL2', tag='del-group', redeemed=0)
+            self.event.vouchers.create(product=self.ticket, code='DEL3', tag='del-group', redeemed=1)
 
         response = self.client.get(
-            '/control/event/%s/%s/vouchers/%s/delete_group' % (self.orga.slug, self.event.slug, v1.pk)
+            f'/control/event/{self.orga.slug}/{self.event.slug}/vouchers/{v1.pk}/delete_group'
         )
         assert response.status_code == 200
         content = response.content.decode()
@@ -1088,7 +1088,7 @@ class VoucherFilterEmptyStateTest(SoupTestMixin, TestCase):
         assert 'DEL2' not in content
 
         post_response = self.client.post(
-            '/control/event/%s/%s/vouchers/%s/delete_group' % (self.orga.slug, self.event.slug, v1.pk)
+            f'/control/event/{self.orga.slug}/{self.event.slug}/vouchers/{v1.pk}/delete_group'
         )
         assert post_response.status_code == 302
         with scopes_disabled():
@@ -1099,7 +1099,7 @@ class VoucherFilterEmptyStateTest(SoupTestMixin, TestCase):
         with scopes_disabled():
             v1 = self.event.vouchers.create(product=self.ticket, code='ACT1', tag='act-group')
         response = self.client.post(
-            '/control/event/%s/%s/vouchers/bulk_action' % (self.orga.slug, self.event.slug),
+            f'/control/event/{self.orga.slug}/{self.event.slug}/vouchers/bulk_action',
             {
                 'action': 'edit',
                 'voucher': [v1.pk],
@@ -1108,5 +1108,76 @@ class VoucherFilterEmptyStateTest(SoupTestMixin, TestCase):
         assert response.status_code == 200
         content = response.content.decode()
         assert 'Edit vouchers' in content
+
+    def test_voucher_list_group_row_non_uniform_shows_varies(self):
+        with scopes_disabled():
+            shirt = Item.objects.create(event=self.event, name='Shirt', default_price=10)
+            self.event.vouchers.create(
+                product=self.ticket,
+                code='VAR1',
+                tag='varied-group',
+                valid_until=datetime.datetime(2025, 1, 1, tzinfo=datetime.UTC),
+            )
+            self.event.vouchers.create(
+                product=shirt,
+                code='VAR2',
+                tag='varied-group',
+                valid_until=datetime.datetime(2025, 2, 1, tzinfo=datetime.UTC),
+            )
+        response = self.client.get(f'/control/event/{self.orga.slug}/{self.event.slug}/vouchers/')
+        assert response.status_code == 200
+        content = response.content.decode()
+        assert 'varied-group' in content
+        assert 'Varies' in content
+
+    def test_voucher_group_delete_rejects_modified_tag(self):
+        with scopes_disabled():
+            v1 = self.event.vouchers.create(product=self.ticket, code='TAG1', tag='tag-initial', redeemed=0)
+        response = self.client.post(
+            f'/control/event/{self.orga.slug}/{self.event.slug}/vouchers/{v1.pk}/delete_group',
+            {'original_tag': 'tag-different'},
+        )
+        assert response.status_code == 302
+        with scopes_disabled():
+            assert self.event.vouchers.filter(code='TAG1').exists()
+
+    def test_voucher_bulk_edit_target_tag_decoupled_from_edited_tag(self):
+        with scopes_disabled():
+            v1 = self.event.vouchers.create(product=self.ticket, code='TGT1', tag='old-tag')
+            v2 = self.event.vouchers.create(product=self.ticket, code='TGT2', tag='old-tag')
+        response = self.client.post(
+            f'/control/event/{self.orga.slug}/{self.event.slug}/vouchers/bulk_edit',
+            {
+                'action': 'save_confirm',
+                'target_tag': 'old-tag',
+                'original_tag': 'old-tag',
+                '_bulk': ['tag'],
+                'tag': 'new-tag',
+            },
+        )
+        assert response.status_code == 302
+        with scopes_disabled():
+            v1.refresh_from_db()
+            v2.refresh_from_db()
+            assert v1.tag == 'new-tag'
+            assert v2.tag == 'new-tag'
+
+    def test_voucher_bulk_edit_validates_merged_values_rejects_missing_variation(self):
+        with scopes_disabled():
+            shirt = Item.objects.create(event=self.event, name='Shirt with vars', default_price=10)
+            shirt.variations.create(value='Red')
+            self.event.vouchers.create(product=shirt, code='VAR_BLOCK', tag='var-tag', block_quota=False)
+        response = self.client.post(
+            f'/control/event/{self.orga.slug}/{self.event.slug}/vouchers/bulk_edit',
+            {
+                'action': 'save',
+                'target_tag': 'var-tag',
+                '_bulk': ['block_quota'],
+                'block_quota': 'on',
+            },
+        )
+        assert response.status_code == 200
+        content = response.content.decode()
+        assert 'You can only block quota if you specify a specific product variation' in content
 
 

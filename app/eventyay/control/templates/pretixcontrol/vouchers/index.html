@@ -197,39 +197,53 @@
                                             {% endif %}
                                         </td>
                                         <td class="list-meta"><span class="category-pill">{{ v.group_redeemed }} / {{ v.group_max_usages }}</span></td>
-                                        <td>{{ v.valid_until|date }}</td>
+                                        <td>
+                                            {% if v.uniform_date %}
+                                                {{ v.valid_until|date }}
+                                            {% else %}
+                                                <span class="text-muted">{% trans "Varies" %}</span>
+                                            {% endif %}
+                                        </td>
                                         <td class="list-meta">
                                             {% if v.tag %}<span class="category-pill">{{ v.tag }}</span>{% endif %}
                                         </td>
                                         <td>
-                                            {% if v.limit_products.all or v.limit_variations.all %}
-                                                {% for p in v.limit_products.all %}
-                                                    {{ p }}{% if not forloop.last or v.limit_variations.all %}, {% endif %}
-                                                {% endfor %}
-                                                {% for var in v.limit_variations.all %}
-                                                    {{ var.product }} – {{ var }}{% if not forloop.last %}, {% endif %}
-                                                {% endfor %}
-                                            {% elif v.product %}
-                                                {{ v.product }}
-                                                {% if v.variation %}
-                                                    – {{ v.variation }}
+                                            {% if v.uniform_product %}
+                                                {% if v.limit_products.all or v.limit_variations.all %}
+                                                    {% for p in v.limit_products.all %}
+                                                        {{ p }}{% if not forloop.last or v.limit_variations.all %}, {% endif %}
+                                                    {% endfor %}
+                                                    {% for var in v.limit_variations.all %}
+                                                        {{ var.product }} – {{ var }}{% if not forloop.last %}, {% endif %}
+                                                    {% endfor %}
+                                                {% elif v.product %}
+                                                    {{ v.product }}
+                                                    {% if v.variation %}
+                                                        – {{ v.variation }}
+                                                    {% endif %}
+                                                {% elif v.quota %}
+                                                    {% blocktrans trimmed with quota=v.quota.name %}
+                                                        Any product in quota "{{ quota }}"
+                                                    {% endblocktrans %}
+                                                {% else %}
+                                                    {% trans "All products" %}
                                                 {% endif %}
-                                            {% elif v.quota %}
-                                                {% blocktrans trimmed with quota=v.quota.name %}
-                                                    Any product in quota "{{ quota }}"
-                                                {% endblocktrans %}
+                                                {% if v.seat %}<small class="text-muted">{{ v.seat }}</small>{% endif %}
                                             {% else %}
-                                                {% trans "All products" %}
+                                                <span class="text-muted">{% trans "Varies" %}</span>
                                             {% endif %}
-                                            {% if v.seat %}<small class="text-muted">{{ v.seat }}</small>{% endif %}
                                         </td>
                                         {% if request.event.has_subevents %}
                                             <td>
-                                                {% if v.subevent %}
-                                                    {{ v.subevent.name }} – {{ v.subevent.get_date_range_display }}
-                                                    {% if request.event.settings.show_times %}
-                                                        {{ v.subevent.date_from|date:"TIME_FORMAT" }}
+                                                {% if v.uniform_subevent %}
+                                                    {% if v.subevent %}
+                                                        {{ v.subevent.name }} – {{ v.subevent.get_date_range_display }}
+                                                        {% if request.event.settings.show_times %}
+                                                            {{ v.subevent.date_from|date:"TIME_FORMAT" }}
+                                                        {% endif %}
                                                     {% endif %}
+                                                {% else %}
+                                                    <span class="text-muted">{% trans "Varies" %}</span>
                                                 {% endif %}
                                             </td>
                                         {% endif %}

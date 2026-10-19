@@ -7,7 +7,7 @@ from django.conf import settings
 from django.contrib import messages
 from django.core.exceptions import ValidationError
 from django.db import connection, transaction
-from django.db.models import Count, Min, Q, Subquery, Sum
+from django.db.models import Case, Count, Min, Q, Subquery, Sum, When
 from django.http import (
     Http404,
     HttpResponse,
@@ -20,19 +20,21 @@ from django.urls import resolve, reverse
 from django.utils.functional import cached_property
 from django.utils.html import format_html
 from django.utils.safestring import mark_safe
+from django.utils.timezone import now
 from django.utils.translation import gettext_lazy as _
 from django.views.generic import (
     CreateView,
     DeleteView,
     ListView,
-    TemplateView,
     UpdateView,
     View,
 )
 
-from eventyay.base.models import CartPosition, LogEntry, OrderPosition, Voucher
+from eventyay.api.webhooks import notify_webhooks
+from eventyay.base.models import CartPosition, LogEntry, Voucher
 from eventyay.base.models.vouchers import _generate_random_code
 from eventyay.base.services.locking import NoLockManager
+from eventyay.base.services.notifications import notify
 from eventyay.base.services.vouchers import vouchers_send
 from eventyay.base.views.tasks import AsyncFormView
 from eventyay.control.forms.filter import VoucherFilterForm, advanced_filter_count, advanced_filters_open_from_get
@@ -87,7 +89,17 @@ class VoucherList(PaginationMixin, EventPermissionRequiredMixin, ListView):
                 for total in self.request.event.vouchers.filter(waitinglistentries__isnull=True, tag__in=group_tags)
                 .order_by()
                 .values('tag')
-                .annotate(group_redeemed=Sum('redeemed'), group_max_usages=Sum('max_usages'), group_count=Count('pk'))
+                .annotate(
+                    group_redeemed=Sum('redeemed'),
+                    group_max_usages=Sum('max_usages'),
+                    group_count=Count('pk'),
+                    distinct_dates=Count('valid_until', distinct=True),
+                    null_dates=Count(Case(When(valid_until__isnull=True, then=1))),
+                    distinct_products=Count('product', distinct=True),
+                    null_products=Count(Case(When(product__isnull=True, then=1))),
+                    distinct_subevents=Count('subevent', distinct=True),
+                    null_subevents=Count(Case(When(subevent__isnull=True, then=1))),
+                )
             }
             for voucher in vouchers:
                 if voucher.tag:
@@ -95,6 +107,12 @@ class VoucherList(PaginationMixin, EventPermissionRequiredMixin, ListView):
                     voucher.group_redeemed = total['group_redeemed'] if total else 0
                     voucher.group_max_usages = total['group_max_usages'] if total else 0
                     voucher.group_count = total['group_count'] if total else 0
+                    null_date_flag = 1 if (total and total['null_dates'] > 0) else 0
+                    voucher.uniform_date = (total['distinct_dates'] + null_date_flag <= 1) if total else True
+                    null_prod_flag = 1 if (total and total['null_products'] > 0) else 0
+                    voucher.uniform_product = (total['distinct_products'] + null_prod_flag <= 1) if total else True
+                    null_sub_flag = 1 if (total and total['null_subevents'] > 0) else 0
+                    voucher.uniform_subevent = (total['distinct_subevents'] + null_sub_flag <= 1) if total else True
 
         return ctx
 
@@ -644,7 +662,7 @@ class VoucherBulkAction(EventPermissionRequiredMixin, View):
                     messages.success(request, _('The other selected vouchers have been deleted.'))
             else:
                 messages.success(request, _('The selected vouchers have been deleted.'))
-            request.event.cache.clear()
+            transaction.on_commit(request.event.cache.clear)
         return redirect(self.get_success_url())
 
     def get_success_url(self) -> str:
@@ -659,6 +677,15 @@ class VoucherBulkAction(EventPermissionRequiredMixin, View):
 
 class VoucherGroupDelete(EventPermissionRequiredMixin, View):
     permission = 'can_change_vouchers'
+
+    def get_success_url(self) -> str:
+        return reverse(
+            'control:event.vouchers',
+            kwargs={
+                'organizer': self.request.event.organizer.slug,
+                'event': self.request.event.slug,
+            },
+        )
 
     def get_group_vouchers(self):
         try:
@@ -687,33 +714,36 @@ class VoucherGroupDelete(EventPermissionRequiredMixin, View):
     @transaction.atomic
     def post(self, request, *args, **kwargs):
         rep, vouchers = self.get_group_vouchers()
-        allowed_ids = list(
-            vouchers.filter(redeemed=0, orderposition__isnull=True).values_list('pk', flat=True)
+        expected_tag = request.POST.get('original_tag')
+        if expected_tag and rep.tag != expected_tag:
+            messages.error(request, _('The voucher group was modified. Please try again.'))
+            return redirect(self.get_success_url())
+
+        allowed = list(
+            vouchers.filter(redeemed=0, orderposition__isnull=True).select_for_update(of=('self',))
         )
+        allowed_ids = [v.pk for v in allowed]
 
         if allowed_ids:
-            allowed = list(self.request.event.vouchers.filter(pk__in=allowed_ids).select_for_update())
             CartPosition.objects.filter(addon_to__voucher_id__in=allowed_ids).delete()
             CartPosition.objects.filter(voucher_id__in=allowed_ids).delete()
-            log_entries = []
-            for v in allowed:
-                log_entries.append(v.log_action('eventyay.voucher.deleted', user=request.user, save=False))
-            LogEntry.objects.bulk_create(log_entries, batch_size=200)
+            log_entries = [
+                v.log_action('eventyay.voucher.deleted', user=request.user, save=False)
+                for v in allowed
+            ]
+            created_entries = LogEntry.objects.bulk_create(log_entries, batch_size=200)
+            transaction.on_commit(lambda: [
+                (notify.apply_async(args=(e.pk,)) if e.notification_type else None,
+                 notify_webhooks.apply_async(args=(e.pk,)) if e.webhook_type else None)
+                for e in created_entries
+            ])
             self.request.event.vouchers.filter(pk__in=allowed_ids).delete()
-            request.event.cache.clear()
+            transaction.on_commit(request.event.cache.clear)
             messages.success(request, _('The unused vouchers in this group have been deleted.'))
         else:
             messages.info(request, _('No unused vouchers were found to delete.'))
 
-        return redirect(
-            reverse(
-                'control:event.vouchers',
-                kwargs={
-                    'organizer': request.event.organizer.slug,
-                    'event': request.event.slug,
-                },
-            )
-        )
+        return redirect(self.get_success_url())
 
 
 class VoucherBulkEdit(EventPermissionRequiredMixin, View):
@@ -723,7 +753,11 @@ class VoucherBulkEdit(EventPermissionRequiredMixin, View):
     def target_vouchers(self):
         group_pks = self.request.GET.getlist('voucher_group') or self.request.POST.getlist('voucher_group')
         voucher_pks = self.request.GET.getlist('voucher') or self.request.POST.getlist('voucher')
-        tag = self.request.GET.get('tag') or self.request.POST.get('tag')
+        target_tag = (
+            self.request.GET.get('target_tag')
+            or self.request.POST.get('target_tag')
+            or self.request.GET.get('tag')
+        )
 
         qs_filter = Q()
         if voucher_pks:
@@ -736,8 +770,8 @@ class VoucherBulkEdit(EventPermissionRequiredMixin, View):
                 .values('tag')
             )
             qs_filter |= Q(tag__in=Subquery(tags))
-        elif tag:
-            qs_filter |= Q(tag=tag)
+        elif target_tag:
+            qs_filter |= Q(tag=target_tag)
 
         if not qs_filter:
             return self.request.event.vouchers.none()
@@ -763,9 +797,13 @@ class VoucherBulkEdit(EventPermissionRequiredMixin, View):
         sample = vouchers[0] if vouchers else Voucher(event=request.event)
         group_pks = request.GET.getlist('voucher_group') or request.POST.getlist('voucher_group')
         voucher_pks = request.GET.getlist('voucher') or request.POST.getlist('voucher')
-        tag = request.GET.get('tag') or request.POST.get('tag')
-        if not tag and group_pks and sample.tag:
-            tag = sample.tag
+        target_tag = (
+            request.GET.get('target_tag')
+            or request.POST.get('target_tag')
+            or request.GET.get('tag')
+        )
+        if not target_tag and group_pks and sample.tag:
+            target_tag = sample.tag
 
         bulk_selected = request.POST.getlist('_bulk') if request.method == 'POST' else []
 
@@ -781,7 +819,7 @@ class VoucherBulkEdit(EventPermissionRequiredMixin, View):
                 'vouchers_fully_used': fully_used,
                 'voucher_pks': voucher_pks,
                 'voucher_group_pks': group_pks,
-                'tag': tag,
+                'target_tag': target_tag,
                 'bulk_selected': bulk_selected,
             },
         )
@@ -792,7 +830,7 @@ class VoucherBulkEdit(EventPermissionRequiredMixin, View):
             return redirect(self.get_success_url())
 
         sample = self.target_vouchers.first()
-        form = VoucherBulkEditForm(instance=sample)
+        form = VoucherBulkEditForm(instance=sample, target_vouchers=self.target_vouchers)
         return self.render_form(request, form)
 
     def post(self, request, *args, **kwargs):
@@ -805,13 +843,17 @@ class VoucherBulkEdit(EventPermissionRequiredMixin, View):
 
         if action in ('edit', None):
             form = (
-                VoucherBulkEditForm(data=request.POST, instance=sample)
+                VoucherBulkEditForm(
+                    data=request.POST, instance=sample, target_vouchers=self.target_vouchers
+                )
                 if '_bulk' in request.POST
-                else VoucherBulkEditForm(instance=sample)
+                else VoucherBulkEditForm(instance=sample, target_vouchers=self.target_vouchers)
             )
             return self.render_form(request, form)
 
-        form = VoucherBulkEditForm(data=request.POST, instance=sample)
+        form = VoucherBulkEditForm(
+            data=request.POST, instance=sample, target_vouchers=self.target_vouchers
+        )
         bulk_fields = [f for f in request.POST.getlist('_bulk') if f in form.fields or f == 'productvar']
 
         if not bulk_fields:
@@ -836,6 +878,15 @@ class VoucherBulkEdit(EventPermissionRequiredMixin, View):
             else:
                 to_update.append(v)
 
+        group_pks = request.POST.getlist('voucher_group')
+        voucher_pks = request.POST.getlist('voucher')
+        expected_tag = request.POST.get('original_tag')
+        if action == 'save_confirm' and group_pks and expected_tag:
+            current_tags = set(self.request.event.vouchers.filter(pk__in=group_pks).values_list('tag', flat=True))
+            if current_tags != {expected_tag}:
+                messages.error(request, _('The voucher group was modified. Please try again.'))
+                return redirect(self.get_success_url())
+
         if action == 'save':
             # Step 2: Show confirmation preview before saving
             changed_fields_summary = []
@@ -852,10 +903,16 @@ class VoucherBulkEdit(EventPermissionRequiredMixin, View):
                         changed_fields_summary.append((label, val))
                 elif f == 'productvar':
                     if form._limit_products or form._limit_variations:
-                        parts = [str(p) for p in form._limit_products] + [f'{v.product} – {v}' for v in form._limit_variations]
+                        parts = [str(p) for p in form._limit_products] + [
+                            f'{v.product} – {v}' for v in form._limit_variations
+                        ]
                         display_val = ', '.join(parts)
                     elif form.instance.product:
-                        display_val = f'{form.instance.product} – {form.instance.variation}' if form.instance.variation else str(form.instance.product)
+                        display_val = (
+                            f'{form.instance.product} – {form.instance.variation}'
+                            if form.instance.variation
+                            else str(form.instance.product)
+                        )
                     elif form.instance.quota:
                         display_val = _('Any product in quota "{quota}"').format(quota=form.instance.quota.name)
                     else:
@@ -864,11 +921,13 @@ class VoucherBulkEdit(EventPermissionRequiredMixin, View):
                 else:
                     changed_fields_summary.append((label, val))
 
-            group_pks = request.POST.getlist('voucher_group')
-            voucher_pks = request.POST.getlist('voucher')
-            tag = request.POST.get('tag')
-            if not tag and group_pks and sample.tag:
-                tag = sample.tag
+            target_tag = (
+                request.POST.get('target_tag')
+                or request.GET.get('target_tag')
+                or request.GET.get('tag')
+            )
+            if not target_tag and group_pks and sample.tag:
+                target_tag = sample.tag
 
             return render(
                 request,
@@ -882,19 +941,122 @@ class VoucherBulkEdit(EventPermissionRequiredMixin, View):
                     'bulk_fields': bulk_fields,
                     'voucher_pks': voucher_pks,
                     'voucher_group_pks': group_pks,
-                    'tag': tag,
+                    'target_tag': target_tag,
                     'post_data': request.POST,
                 },
             )
 
         elif action == 'save_confirm':
-            # Step 3: Execute updates atomically
-            lockfn = (
-                request.event.lock
-                if ('block_quota' in bulk_fields or 'productvar' in bulk_fields or 'max_usages' in bulk_fields)
-                else NoLockManager
-            )
-            with lockfn(), transaction.atomic():
+            # Step 3: Execute updates atomically under event lock
+            with request.event.lock(), transaction.atomic():
+                # Re-fetch under row lock to reclassify live redemption counts
+                target_ids = list(self.target_vouchers.values_list('pk', flat=True))
+                fresh_vouchers = list(self.request.event.vouchers.filter(pk__in=target_ids).select_for_update())
+                to_update = []
+                skipped_fully_used = []
+                skipped_max_usages = []
+                for v in fresh_vouchers:
+                    if v.redeemed >= v.max_usages:
+                        skipped_fully_used.append(v)
+                    elif new_max_usages is not None and v.redeemed > new_max_usages:
+                        skipped_max_usages.append(v)
+                    else:
+                        to_update.append(v)
+
+                # Quota check under lock using summed max_usages delta
+                total_quota_delta = 0
+                sample_v_data = None
+                sample_old_inst = None
+                sample_eff_quota = None
+                sample_eff_prod = None
+                sample_eff_var = None
+                sample_eff_limit_p = None
+                sample_eff_limit_v = None
+
+                for v in to_update:
+                    eff_quota = form.instance.quota if 'productvar' in bulk_fields else v.quota
+                    eff_product = form.instance.product if 'productvar' in bulk_fields else v.product
+                    eff_variation = form.instance.variation if 'productvar' in bulk_fields else v.variation
+                    eff_limit_p = (
+                        getattr(form, '_limit_products', [])
+                        if 'productvar' in bulk_fields
+                        else list(v.limit_products.all())
+                    )
+                    eff_limit_v = (
+                        getattr(form, '_limit_variations', [])
+                        if 'productvar' in bulk_fields
+                        else list(v.limit_variations.all())
+                    )
+                    eff_block_quota = (
+                        form.cleaned_data['block_quota']
+                        if 'block_quota' in bulk_fields
+                        else v.block_quota
+                    )
+                    eff_subevent = (
+                        form.cleaned_data['subevent']
+                        if 'subevent' in bulk_fields
+                        else v.subevent
+                    )
+                    eff_valid_until = (
+                        form.cleaned_data['valid_until']
+                        if 'valid_until' in bulk_fields
+                        else v.valid_until
+                    )
+                    eff_max_usages = (
+                        form.cleaned_data['max_usages']
+                        if 'max_usages' in bulk_fields
+                        else v.max_usages
+                    )
+
+                    v_data = {
+                        'block_quota': eff_block_quota,
+                        'subevent': eff_subevent,
+                        'valid_until': eff_valid_until,
+                        'max_usages': eff_max_usages,
+                        'allow_ignore_quota': (
+                            form.cleaned_data.get('allow_ignore_quota', False)
+                            if 'allow_ignore_quota' in bulk_fields
+                            else v.allow_ignore_quota
+                        ),
+                    }
+                    product_changed = 'productvar' in bulk_fields and (
+                        eff_quota != v.quota or eff_product != v.product or eff_variation != v.variation
+                    )
+                    if Voucher.clean_quota_needs_checking(v_data, v, product_changed=product_changed, creating=False):
+                        total_quota_delta += eff_max_usages
+                        if sample_v_data is None:
+                            sample_v_data, sample_old_inst = v_data, v
+                            sample_eff_quota = eff_quota
+                            sample_eff_prod = eff_product
+                            sample_eff_var = eff_variation
+                            sample_eff_limit_p, sample_eff_limit_v = eff_limit_p, eff_limit_v
+                    elif eff_block_quota and (v_data['valid_until'] is None or v_data['valid_until'] >= now()):
+                        if 'max_usages' in bulk_fields and eff_max_usages > v.max_usages:
+                            total_quota_delta += (eff_max_usages - v.max_usages)
+                            if sample_v_data is None:
+                                sample_v_data, sample_old_inst = v_data, None
+                                sample_eff_quota = eff_quota
+                                sample_eff_prod = eff_product
+                                sample_eff_var = eff_variation
+                                sample_eff_limit_p, sample_eff_limit_v = eff_limit_p, eff_limit_v
+
+                if total_quota_delta > 0 and sample_v_data:
+                    try:
+                        Voucher.clean_quota_check(
+                            sample_v_data,
+                            total_quota_delta,
+                            sample_old_inst,
+                            request.event,
+                            sample_eff_quota,
+                            sample_eff_prod,
+                            sample_eff_var,
+                            limit_products=sample_eff_limit_p,
+                            limit_variations=sample_eff_limit_v,
+                        )
+                    except ValidationError as e:
+                        messages.error(request, ' '.join(e.messages) if hasattr(e, 'messages') else str(e))
+                        return redirect(self.get_success_url())
+
                 scalar_fields = [f for f in bulk_fields if f not in ('productvar', 'value', 'price_mode')]
                 update_fields = list(scalar_fields)
                 if 'price_mode' in bulk_fields or 'value' in bulk_fields:
@@ -950,8 +1112,13 @@ class VoucherBulkEdit(EventPermissionRequiredMixin, View):
                     v.log_action('eventyay.voucher.changed', user=request.user, data=change_data, save=False)
                     for v in to_update
                 ]
-                LogEntry.objects.bulk_create(log_entries, batch_size=200)
-                request.event.cache.clear()
+                created_entries = LogEntry.objects.bulk_create(log_entries, batch_size=200)
+                transaction.on_commit(lambda: [
+                    (notify.apply_async(args=(e.pk,)) if e.notification_type else None,
+                     notify_webhooks.apply_async(args=(e.pk,)) if e.webhook_type else None)
+                    for e in created_entries
+                ])
+                transaction.on_commit(request.event.cache.clear)
 
             if to_update:
                 messages.success(

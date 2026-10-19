@@ -632,7 +632,8 @@ class VoucherBulkEditForm(VoucherForm):
             'max_usages': _('Number of times EACH of these vouchers can be redeemed.'),
         }
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, target_vouchers=None, **kwargs):
+        self.target_vouchers = list(target_vouchers) if target_vouchers is not None else []
         super().__init__(*args, **kwargs)
         if 'code' in self.fields:
             del self.fields['code']
@@ -668,23 +669,85 @@ class VoucherBulkEditForm(VoucherForm):
                 data['value'] = None
             elif 'price_mode' in bulk_fields and data.get('value') is None:
                 self.add_error('value', _('Please enter a value for the selected price effect.'))
-            Voucher.clean_value_and_budget(data)
 
-        if 'subevent' in bulk_fields:
-            Voucher.clean_subevent(data, self.instance.event)
-
-        if 'block_quota' in bulk_fields or 'productvar' in bulk_fields:
-            Voucher.clean_product_properties(
-                data,
-                self.instance.event,
-                getattr(self.instance, 'quota', None),
-                getattr(self.instance, 'product', None),
-                getattr(self.instance, 'variation', None),
-                seats_given=None,
-                block_quota=data.get('block_quota') if 'block_quota' in bulk_fields else getattr(self.instance, 'block_quota', False),
-                limit_products=getattr(self, '_limit_products', []),
-                limit_variations=getattr(self, '_limit_variations', []),
+        targets = self.target_vouchers or [self.instance]
+        for v in targets:
+            eff_quota = getattr(self.instance, 'quota', None) if 'productvar' in bulk_fields else v.quota
+            eff_product = getattr(self.instance, 'product', None) if 'productvar' in bulk_fields else v.product
+            eff_variation = getattr(self.instance, 'variation', None) if 'productvar' in bulk_fields else v.variation
+            eff_limit_products = (
+                getattr(self, '_limit_products', [])
+                if 'productvar' in bulk_fields
+                else list(v.limit_products.all())
             )
+            eff_limit_variations = (
+                getattr(self, '_limit_variations', [])
+                if 'productvar' in bulk_fields
+                else list(v.limit_variations.all())
+            )
+            eff_block_quota = (
+                data.get('block_quota')
+                if 'block_quota' in bulk_fields
+                else getattr(v, 'block_quota', False)
+            )
+            eff_subevent = (
+                data.get('subevent')
+                if 'subevent' in bulk_fields
+                else getattr(v, 'subevent', None)
+            )
+            eff_valid_until = (
+                data.get('valid_until')
+                if 'valid_until' in bulk_fields
+                else getattr(v, 'valid_until', None)
+            )
+            eff_price_mode = (
+                data.get('price_mode')
+                if 'price_mode' in bulk_fields
+                else getattr(v, 'price_mode', 'none')
+            )
+            eff_value = (
+                data.get('value')
+                if 'value' in bulk_fields
+                else getattr(v, 'value', None)
+            )
+            if 'price_mode' in bulk_fields and data.get('price_mode') == 'none':
+                eff_value = None
+            eff_budget = (
+                data.get('budget')
+                if 'budget' in bulk_fields
+                else getattr(v, 'budget', None)
+            )
+
+            v_data = {
+                'block_quota': eff_block_quota,
+                'subevent': eff_subevent,
+                'valid_until': eff_valid_until,
+                'price_mode': eff_price_mode,
+                'value': eff_value,
+                'budget': eff_budget,
+                'allow_ignore_quota': (
+                    data.get('allow_ignore_quota', False)
+                    if 'allow_ignore_quota' in bulk_fields
+                    else getattr(v, 'allow_ignore_quota', False)
+                ),
+            }
+            try:
+                Voucher.clean_subevent(v_data, self.instance.event)
+                Voucher.clean_product_properties(
+                    v_data,
+                    self.instance.event,
+                    eff_quota,
+                    eff_product,
+                    eff_variation,
+                    seats_given=bool(getattr(v, 'seat', None)),
+                    block_quota=eff_block_quota,
+                    limit_products=eff_limit_products,
+                    limit_variations=eff_limit_variations,
+                )
+                Voucher.clean_value_and_budget(v_data)
+            except ValidationError as e:
+                self.add_error(None, e)
+                break
 
         return data
 
