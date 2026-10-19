@@ -1,0 +1,94 @@
+{% extends "pretixcontrol/items/base.html" %}
+{% load i18n %}
+{% load l10n %}
+{% load eventsignal %}
+{% load bootstrap3 %}
+{% load static %}
+{% block title %}{% trans "Edit vouchers" %}{% endblock %}
+{% block inside %}
+    {% trans "Edit vouchers" as header_title %}
+    {% include "common/includes/header_nav.html" with header_title=header_title header_component_link="pretixcontrol/event/component_link.html" %}
+
+    <div class="alert alert-info">
+        <p>
+            {% blocktrans trimmed with total=vouchers_total unused=vouchers_unused partly=vouchers_partly_used fully=vouchers_fully_used %}
+                You are editing <strong>{{ total }} selected vouchers</strong> ({{ unused }} unused, {{ partly }} partly used, {{ fully }} fully used).
+            {% endblocktrans %}
+        </p>
+        <p>
+            {% blocktrans trimmed %}
+                Only the fields you toggle and change below will be updated. All other settings will remain as they are. Fully used vouchers will not be changed.
+            {% endblocktrans %}
+        </p>
+    </div>
+
+    <form action="" method="post" class="form-horizontal" data-voucher-bulk-form>
+        {% csrf_token %}
+        {% bootstrap_form_errors form %}
+
+        {% for pk in voucher_group_pks %}
+            <input type="hidden" name="voucher_group" value="{{ pk }}">
+        {% endfor %}
+        {% for pk in voucher_pks %}
+            <input type="hidden" name="voucher" value="{{ pk }}">
+        {% endfor %}
+        {% if tag %}
+            <input type="hidden" name="tag" value="{{ tag }}">
+        {% endif %}
+
+        <fieldset>
+            <legend>{% trans "Voucher details" %}</legend>
+            {% bootstrap_field form.max_usages layout="bulkedit" %}
+            {% bootstrap_field form.valid_until layout="bulkedit" %}
+            {% bootstrap_field form.productvar layout="bulkedit" %}
+            <div class="form-group">
+                <label class="col-md-3 control-label">{% trans "Price effect" %}</label>
+                <div class="col-md-9">
+                    <div class="bulk-edit-field-group">
+                        <label class="field-toggle">
+                            <input type="checkbox" name="_bulk" value="price_mode" {% if "price_mode" in bulk_selected or "value" in bulk_selected %}checked{% endif %}>
+                            {% trans "change" context "form_bulk" %}
+                        </label>
+                        <div class="field-content">
+                            <div class="row">
+                                <div class="col-md-6">
+                                    {% bootstrap_field form.price_mode show_label=False form_group_class="" %}
+                                </div>
+                                <div class="col-md-6">
+                                    {% bootstrap_field form.value show_label=False form_group_class="" %}
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            {% if form.subevent %}
+                {% bootstrap_field form.subevent layout="bulkedit" %}
+            {% endif %}
+        </fieldset>
+
+        <fieldset>
+            <legend>{% trans "Advanced settings" %}</legend>
+            {% bootstrap_field form.tag layout="bulkedit" %}
+            {% bootstrap_field form.block_quota layout="bulkedit" %}
+            {% bootstrap_field form.allow_ignore_quota layout="bulkedit" %}
+            {% bootstrap_field form.allow_ignore_approval layout="bulkedit" %}
+            {% bootstrap_field form.all_addons_included layout="bulkedit" %}
+            {% bootstrap_field form.all_bundles_included layout="bulkedit" %}
+            {% bootstrap_field form.budget addon_after=request.event.currency layout="bulkedit" %}
+            {% bootstrap_field form.comment layout="bulkedit" %}
+            {% bootstrap_field form.show_hidden_products layout="bulkedit" %}
+        </fieldset>
+
+        {% eventsignal request.event "eventyay.control.signals.voucher_form_html" form=form %}
+
+        <div class="form-group submit-group">
+            <a href="{% url "control:event.vouchers" organizer=request.event.organizer.slug event=request.event.slug %}" class="btn btn-default btn-cancel">
+                {% trans "Cancel" %}
+            </a>
+            <button type="submit" class="btn btn-primary btn-save" name="action" value="save">
+                {% trans "Save" %}
+            </button>
+        </div>
+    </form>
+{% endblock %}

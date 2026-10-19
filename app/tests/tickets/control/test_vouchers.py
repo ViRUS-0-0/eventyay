@@ -975,3 +975,138 @@ class VoucherFilterEmptyStateTest(SoupTestMixin, TestCase):
         assert "You haven't created any vouchers yet." in content
         assert 'Your search did not match any vouchers.' not in content
 
+    def test_voucher_list_group_row_actions_and_badge(self):
+        with scopes_disabled():
+            self.event.vouchers.create(product=self.ticket, code='VOL1', tag='volunteers')
+            self.event.vouchers.create(product=self.ticket, code='VOL2', tag='volunteers')
+            self.event.vouchers.create(product=self.ticket, code='SINGLE1')
+        response = self.client.get('/control/event/%s/%s/vouchers/' % (self.orga.slug, self.event.slug))
+        assert response.status_code == 200
+        content = response.content.decode()
+        assert 'volunteers' in content
+        assert '2 vouchers' in content
+        assert 'title="Edit group"' in content
+        assert 'title="Delete group"' in content
+        assert 'title="Edit voucher"' in content
+        assert 'Edit selected' in content
+
+    def test_voucher_bulk_edit_view_get(self):
+        with scopes_disabled():
+            v1 = self.event.vouchers.create(product=self.ticket, code='VOL1', tag='volunteers')
+        response = self.client.get(
+            '/control/event/%s/%s/vouchers/bulk_edit?voucher_group=%s' % (self.orga.slug, self.event.slug, v1.pk)
+        )
+        assert response.status_code == 200
+        content = response.content.decode()
+        assert 'Edit vouchers' in content
+        assert 'name="max_usages"' in content
+        assert 'name="valid_until_0"' in content
+        assert 'name="codes"' not in content
+
+    def test_voucher_bulk_edit_preview_and_skip_rules(self):
+        with scopes_disabled():
+            v_unused = self.event.vouchers.create(
+                product=self.ticket, code='VOL_U', tag='volunteers', max_usages=1, redeemed=0
+            )
+            v_partly = self.event.vouchers.create(
+                product=self.ticket, code='VOL_P', tag='volunteers', max_usages=5, redeemed=2
+            )
+            v_fully = self.event.vouchers.create(
+                product=self.ticket, code='VOL_F', tag='volunteers', max_usages=2, redeemed=2
+            )
+        response = self.client.post(
+            '/control/event/%s/%s/vouchers/bulk_edit' % (self.orga.slug, self.event.slug),
+            {
+                'action': 'save',
+                'voucher_group': [v_unused.pk],
+                '_bulk': ['max_usages', 'valid_until'],
+                'max_usages': '1',
+                'valid_until_0': '2026-12-31',
+                'valid_until_1': '23:59:59',
+            },
+        )
+        assert response.status_code == 200
+        content = response.content.decode()
+        assert 'Review changes before saving' in content
+        assert '1 voucher</strong> will be updated' in content
+        assert '1 voucher is fully used' in content
+        assert 'more redemptions than the new maximum usages' in content
+
+    def test_voucher_bulk_edit_save_confirm_updates_and_logs(self):
+        with scopes_disabled():
+            v_unused = self.event.vouchers.create(
+                product=self.ticket, code='VOL_U2', tag='volunteers2', max_usages=3, redeemed=0
+            )
+            v_partly = self.event.vouchers.create(
+                product=self.ticket, code='VOL_P2', tag='volunteers2', max_usages=5, redeemed=2
+            )
+            v_fully = self.event.vouchers.create(
+                product=self.ticket, code='VOL_F2', tag='volunteers2', max_usages=2, redeemed=2
+            )
+        response = self.client.post(
+            '/control/event/%s/%s/vouchers/bulk_edit' % (self.orga.slug, self.event.slug),
+            {
+                'action': 'save_confirm',
+                'voucher_group': [v_unused.pk],
+                '_bulk': ['max_usages', 'comment'],
+                'max_usages': '1',
+                'comment': 'bulk updated comment',
+            },
+        )
+        assert response.status_code == 302
+        with scopes_disabled():
+            v_unused.refresh_from_db()
+            v_partly.refresh_from_db()
+            v_fully.refresh_from_db()
+
+            assert v_unused.max_usages == 1
+            assert v_unused.comment == 'bulk updated comment'
+            assert v_partly.max_usages == 5
+            assert v_partly.comment == ''
+            assert v_fully.max_usages == 2
+            assert v_fully.comment == ''
+
+            logs = list(v_unused.all_logentries())
+            assert any(l.action_type == 'eventyay.voucher.changed' for l in logs)
+
+    def test_voucher_group_delete_get_and_post(self):
+        with scopes_disabled():
+            v1 = self.event.vouchers.create(product=self.ticket, code='DEL1', tag='del-group', redeemed=0)
+            v2 = self.event.vouchers.create(product=self.ticket, code='DEL2', tag='del-group', redeemed=0)
+            v3 = self.event.vouchers.create(product=self.ticket, code='DEL3', tag='del-group', redeemed=1)
+
+        response = self.client.get(
+            '/control/event/%s/%s/vouchers/%s/delete_group' % (self.orga.slug, self.event.slug, v1.pk)
+        )
+        assert response.status_code == 200
+        content = response.content.decode()
+        assert 'Delete vouchers' in content
+        assert 'del-group' in content
+        assert '2 unused vouchers' in content
+        assert '1 used voucher' in content
+        assert 'DEL1' not in content
+        assert 'DEL2' not in content
+
+        post_response = self.client.post(
+            '/control/event/%s/%s/vouchers/%s/delete_group' % (self.orga.slug, self.event.slug, v1.pk)
+        )
+        assert post_response.status_code == 302
+        with scopes_disabled():
+            assert not self.event.vouchers.filter(code__in=['DEL1', 'DEL2']).exists()
+            assert self.event.vouchers.filter(code='DEL3').exists()
+
+    def test_voucher_bulk_action_edit_selected(self):
+        with scopes_disabled():
+            v1 = self.event.vouchers.create(product=self.ticket, code='ACT1', tag='act-group')
+        response = self.client.post(
+            '/control/event/%s/%s/vouchers/bulk_action' % (self.orga.slug, self.event.slug),
+            {
+                'action': 'edit',
+                'voucher': [v1.pk],
+            },
+        )
+        assert response.status_code == 200
+        content = response.content.decode()
+        assert 'Edit vouchers' in content
+
+

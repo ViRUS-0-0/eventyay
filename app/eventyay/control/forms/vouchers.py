@@ -597,3 +597,94 @@ class VoucherBulkForm(VoucherForm):
     def post_bulk_save(self, objs):
         for obj in objs:
             self._apply_product_limits(obj)
+
+
+class VoucherBulkEditForm(VoucherForm):
+    class Meta:
+        model = Voucher
+        localized_fields = '__all__'
+        fields = [
+            'tag',
+            'valid_until',
+            'block_quota',
+            'allow_ignore_quota',
+            'allow_ignore_approval',
+            'value',
+            'comment',
+            'max_usages',
+            'price_mode',
+            'subevent',
+            'show_hidden_products',
+            'all_addons_included',
+            'all_bundles_included',
+            'budget',
+        ]
+        field_classes = {
+            'valid_until': SplitDateTimeField,
+            'subevent': SafeModelChoiceField,
+        }
+        widgets = {
+            'valid_until': SplitDateTimePickerWidget(),
+        }
+        labels = {'max_usages': _('Maximum usages per voucher')}
+        help_texts = {
+            'tag': _('Vouchers with the same tag are shown together in the voucher list.'),
+            'max_usages': _('Number of times EACH of these vouchers can be redeemed.'),
+        }
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if 'code' in self.fields:
+            del self.fields['code']
+        for field in self.fields.values():
+            field.required = False
+            if hasattr(field, 'one_required'):
+                field.one_required = False
+
+    def clean(self):
+        bulk_fields = set(self.data.getlist('_bulk'))
+        data = self.cleaned_data
+
+        if 'productvar' in bulk_fields:
+            try:
+                quota, product, variation, limit_products, limit_variations = self._parse_productvar_selection(
+                    data.get('productvar')
+                )
+                self.instance.quota = quota
+                self.instance.product = product
+                self.instance.variation = variation
+                self._limit_products = limit_products
+                self._limit_variations = limit_variations
+            except (ObjectDoesNotExist, ValueError):
+                raise ValidationError(_('Invalid product selected.'))
+
+        if 'max_usages' in bulk_fields:
+            val = data.get('max_usages')
+            if val is None or val < 1:
+                self.add_error('max_usages', _('Maximum usages must be at least 1.'))
+
+        if 'price_mode' in bulk_fields or 'value' in bulk_fields or 'budget' in bulk_fields:
+            if data.get('price_mode') == 'none':
+                data['value'] = None
+            elif 'price_mode' in bulk_fields and data.get('value') is None:
+                self.add_error('value', _('Please enter a value for the selected price effect.'))
+            Voucher.clean_value_and_budget(data)
+
+        if 'subevent' in bulk_fields:
+            Voucher.clean_subevent(data, self.instance.event)
+
+        if 'block_quota' in bulk_fields or 'productvar' in bulk_fields:
+            Voucher.clean_product_properties(
+                data,
+                self.instance.event,
+                getattr(self.instance, 'quota', None),
+                getattr(self.instance, 'product', None),
+                getattr(self.instance, 'variation', None),
+                seats_given=None,
+                block_quota=data.get('block_quota') if 'block_quota' in bulk_fields else getattr(self.instance, 'block_quota', False),
+                limit_products=getattr(self, '_limit_products', []),
+                limit_variations=getattr(self, '_limit_variations', []),
+            )
+
+        return data
+

@@ -1,3 +1,5 @@
+import datetime
+import decimal
 import io
 
 from defusedcsv import csv
@@ -5,7 +7,7 @@ from django.conf import settings
 from django.contrib import messages
 from django.core.exceptions import ValidationError
 from django.db import connection, transaction
-from django.db.models import Min, Q, Subquery, Sum
+from django.db.models import Count, Min, Q, Subquery, Sum
 from django.http import (
     Http404,
     HttpResponse,
@@ -34,7 +36,7 @@ from eventyay.base.services.locking import NoLockManager
 from eventyay.base.services.vouchers import vouchers_send
 from eventyay.base.views.tasks import AsyncFormView
 from eventyay.control.forms.filter import VoucherFilterForm, advanced_filter_count, advanced_filters_open_from_get
-from eventyay.control.forms.vouchers import VoucherBulkForm, VoucherForm
+from eventyay.control.forms.vouchers import VoucherBulkEditForm, VoucherBulkForm, VoucherForm
 from eventyay.control.permissions import EventPermissionRequiredMixin
 from eventyay.control.signals import voucher_form_class
 from eventyay.control.views import PaginationMixin
@@ -85,13 +87,14 @@ class VoucherList(PaginationMixin, EventPermissionRequiredMixin, ListView):
                 for total in self.request.event.vouchers.filter(waitinglistentries__isnull=True, tag__in=group_tags)
                 .order_by()
                 .values('tag')
-                .annotate(group_redeemed=Sum('redeemed'), group_max_usages=Sum('max_usages'))
+                .annotate(group_redeemed=Sum('redeemed'), group_max_usages=Sum('max_usages'), group_count=Count('pk'))
             }
             for voucher in vouchers:
                 if voucher.tag:
                     total = group_totals.get(voucher.tag)
                     voucher.group_redeemed = total['group_redeemed'] if total else 0
                     voucher.group_max_usages = total['group_max_usages'] if total else 0
+                    voucher.group_count = total['group_count'] if total else 0
 
         return ctx
 
@@ -593,7 +596,23 @@ class VoucherBulkAction(EventPermissionRequiredMixin, View):
         if not self.objects.exists():
             return redirect(self.get_success_url())
 
+        if request.POST.get('action') == 'edit':
+            return VoucherBulkEdit.as_view()(request, *args, **kwargs)
+
         if request.POST.get('action') == 'delete':
+            selected_groups = self.request.POST.getlist('voucher_group')
+            selected_vouchers = self.request.POST.getlist('voucher')
+            if selected_groups and not selected_vouchers and len(selected_groups) == 1:
+                return redirect(
+                    reverse(
+                        'control:event.voucher.delete_group',
+                        kwargs={
+                            'organizer': request.event.organizer.slug,
+                            'event': request.event.slug,
+                            'voucher': selected_groups[0],
+                        },
+                    )
+                )
             return render(
                 request,
                 'pretixcontrol/vouchers/delete_bulk.html',
@@ -608,10 +627,12 @@ class VoucherBulkAction(EventPermissionRequiredMixin, View):
             has_allowed = allowed.exists()
             has_forbidden = forbidden.exists()
 
+            allowed_ids = list(allowed.values_list('pk', flat=True))
+            CartPosition.objects.filter(addon_to__voucher_id__in=allowed_ids).delete()
+            CartPosition.objects.filter(voucher_id__in=allowed_ids).delete()
+
             for obj in allowed.iterator():
                 obj.log_action('eventyay.voucher.deleted', user=self.request.user)
-                CartPosition.objects.filter(addon_to__voucher=obj).delete()
-                obj.cartposition_set.all().delete()
                 obj.delete()
 
             if has_forbidden:
@@ -623,6 +644,7 @@ class VoucherBulkAction(EventPermissionRequiredMixin, View):
                     messages.success(request, _('The other selected vouchers have been deleted.'))
             else:
                 messages.success(request, _('The selected vouchers have been deleted.'))
+            request.event.cache.clear()
         return redirect(self.get_success_url())
 
     def get_success_url(self) -> str:
@@ -633,3 +655,313 @@ class VoucherBulkAction(EventPermissionRequiredMixin, View):
                 'event': self.request.event.slug,
             },
         )
+
+
+class VoucherGroupDelete(EventPermissionRequiredMixin, View):
+    permission = 'can_change_vouchers'
+
+    def get_group_vouchers(self):
+        try:
+            rep = self.request.event.vouchers.get(pk=self.kwargs['voucher'])
+        except Voucher.DoesNotExist:
+            raise Http404(_('The requested voucher does not exist.'))
+        if not rep.tag:
+            raise Http404(_('The requested voucher does not belong to a group.'))
+        return rep, self.request.event.vouchers.filter(tag=rep.tag, waitinglistentries__isnull=True)
+
+    def get(self, request, *args, **kwargs):
+        rep, vouchers = self.get_group_vouchers()
+        unused = vouchers.filter(redeemed=0, orderposition__isnull=True)
+        used = vouchers.exclude(redeemed=0, orderposition__isnull=True)
+        return render(
+            request,
+            'pretixcontrol/vouchers/delete_bulk.html',
+            {
+                'group_voucher': rep,
+                'tag': rep.tag,
+                'unused_count': unused.count(),
+                'used_count': used.count(),
+            },
+        )
+
+    @transaction.atomic
+    def post(self, request, *args, **kwargs):
+        rep, vouchers = self.get_group_vouchers()
+        allowed_ids = list(
+            vouchers.filter(redeemed=0, orderposition__isnull=True).values_list('pk', flat=True)
+        )
+
+        if allowed_ids:
+            allowed = list(self.request.event.vouchers.filter(pk__in=allowed_ids).select_for_update())
+            CartPosition.objects.filter(addon_to__voucher_id__in=allowed_ids).delete()
+            CartPosition.objects.filter(voucher_id__in=allowed_ids).delete()
+            log_entries = []
+            for v in allowed:
+                log_entries.append(v.log_action('eventyay.voucher.deleted', user=request.user, save=False))
+            LogEntry.objects.bulk_create(log_entries, batch_size=200)
+            self.request.event.vouchers.filter(pk__in=allowed_ids).delete()
+            request.event.cache.clear()
+            messages.success(request, _('The unused vouchers in this group have been deleted.'))
+        else:
+            messages.info(request, _('No unused vouchers were found to delete.'))
+
+        return redirect(
+            reverse(
+                'control:event.vouchers',
+                kwargs={
+                    'organizer': request.event.organizer.slug,
+                    'event': request.event.slug,
+                },
+            )
+        )
+
+
+class VoucherBulkEdit(EventPermissionRequiredMixin, View):
+    permission = 'can_change_vouchers'
+
+    @cached_property
+    def target_vouchers(self):
+        group_pks = self.request.GET.getlist('voucher_group') or self.request.POST.getlist('voucher_group')
+        voucher_pks = self.request.GET.getlist('voucher') or self.request.POST.getlist('voucher')
+        tag = self.request.GET.get('tag') or self.request.POST.get('tag')
+
+        qs_filter = Q()
+        if voucher_pks:
+            qs_filter |= Q(pk__in=voucher_pks)
+        if group_pks:
+            tags = (
+                self.request.event.vouchers.filter(pk__in=group_pks)
+                .exclude(tag='')
+                .order_by()
+                .values('tag')
+            )
+            qs_filter |= Q(tag__in=Subquery(tags))
+        elif tag:
+            qs_filter |= Q(tag=tag)
+
+        if not qs_filter:
+            return self.request.event.vouchers.none()
+
+        return self.request.event.vouchers.filter(qs_filter, waitinglistentries__isnull=True).distinct()
+
+    def get_success_url(self) -> str:
+        return reverse(
+            'control:event.vouchers',
+            kwargs={
+                'organizer': self.request.event.organizer.slug,
+                'event': self.request.event.slug,
+            },
+        )
+
+    def render_form(self, request, form):
+        vouchers = list(self.target_vouchers)
+        total = len(vouchers)
+        unused = sum(1 for v in vouchers if v.redeemed == 0)
+        partly_used = sum(1 for v in vouchers if 0 < v.redeemed < v.max_usages)
+        fully_used = sum(1 for v in vouchers if v.redeemed >= v.max_usages)
+
+        sample = vouchers[0] if vouchers else Voucher(event=request.event)
+        group_pks = request.GET.getlist('voucher_group') or request.POST.getlist('voucher_group')
+        voucher_pks = request.GET.getlist('voucher') or request.POST.getlist('voucher')
+        tag = request.GET.get('tag') or request.POST.get('tag')
+        if not tag and group_pks and sample.tag:
+            tag = sample.tag
+
+        bulk_selected = request.POST.getlist('_bulk') if request.method == 'POST' else []
+
+        return render(
+            request,
+            'pretixcontrol/vouchers/bulk_edit.html',
+            {
+                'form': form,
+                'sample': sample,
+                'vouchers_total': total,
+                'vouchers_unused': unused,
+                'vouchers_partly_used': partly_used,
+                'vouchers_fully_used': fully_used,
+                'voucher_pks': voucher_pks,
+                'voucher_group_pks': group_pks,
+                'tag': tag,
+                'bulk_selected': bulk_selected,
+            },
+        )
+
+    def get(self, request, *args, **kwargs):
+        if not self.target_vouchers.exists():
+            messages.warning(request, _('No vouchers selected.'))
+            return redirect(self.get_success_url())
+
+        sample = self.target_vouchers.first()
+        form = VoucherBulkEditForm(instance=sample)
+        return self.render_form(request, form)
+
+    def post(self, request, *args, **kwargs):
+        if not self.target_vouchers.exists():
+            messages.warning(request, _('No vouchers selected.'))
+            return redirect(self.get_success_url())
+
+        sample = self.target_vouchers.first()
+        action = request.POST.get('action')
+
+        if action in ('edit', None):
+            form = (
+                VoucherBulkEditForm(data=request.POST, instance=sample)
+                if '_bulk' in request.POST
+                else VoucherBulkEditForm(instance=sample)
+            )
+            return self.render_form(request, form)
+
+        form = VoucherBulkEditForm(data=request.POST, instance=sample)
+        bulk_fields = [f for f in request.POST.getlist('_bulk') if f in form.fields or f == 'productvar']
+
+        if not bulk_fields:
+            messages.error(request, _('You need to select at least one field to change.'))
+            return self.render_form(request, form)
+
+        if not form.is_valid():
+            return self.render_form(request, form)
+
+        # Classify vouchers
+        vouchers = list(self.target_vouchers)
+        new_max_usages = form.cleaned_data.get('max_usages') if 'max_usages' in bulk_fields else None
+        to_update = []
+        skipped_fully_used = []
+        skipped_max_usages = []
+
+        for v in vouchers:
+            if v.redeemed >= v.max_usages:
+                skipped_fully_used.append(v)
+            elif new_max_usages is not None and v.redeemed > new_max_usages:
+                skipped_max_usages.append(v)
+            else:
+                to_update.append(v)
+
+        if action == 'save':
+            # Step 2: Show confirmation preview before saving
+            changed_fields_summary = []
+            for f in bulk_fields:
+                label = form.fields[f].label if f in form.fields else f
+                val = form.cleaned_data.get(f)
+                if f == 'price_mode':
+                    display_val = dict(Voucher.PRICE_MODES).get(val, val)
+                    if val != 'none' and form.cleaned_data.get('value') is not None:
+                        display_val = f'{display_val} ({form.cleaned_data["value"]})'
+                    changed_fields_summary.append((_('Price effect'), display_val))
+                elif f == 'value':
+                    if 'price_mode' not in bulk_fields:
+                        changed_fields_summary.append((label, val))
+                elif f == 'productvar':
+                    if form._limit_products or form._limit_variations:
+                        parts = [str(p) for p in form._limit_products] + [f'{v.product} – {v}' for v in form._limit_variations]
+                        display_val = ', '.join(parts)
+                    elif form.instance.product:
+                        display_val = f'{form.instance.product} – {form.instance.variation}' if form.instance.variation else str(form.instance.product)
+                    elif form.instance.quota:
+                        display_val = _('Any product in quota "{quota}"').format(quota=form.instance.quota.name)
+                    else:
+                        display_val = _('All products')
+                    changed_fields_summary.append((_('Product'), display_val))
+                else:
+                    changed_fields_summary.append((label, val))
+
+            group_pks = request.POST.getlist('voucher_group')
+            voucher_pks = request.POST.getlist('voucher')
+            tag = request.POST.get('tag')
+            if not tag and group_pks and sample.tag:
+                tag = sample.tag
+
+            return render(
+                request,
+                'pretixcontrol/vouchers/bulk_edit_confirm.html',
+                {
+                    'to_update_count': len(to_update),
+                    'skipped_fully_used_count': len(skipped_fully_used),
+                    'skipped_max_usages_count': len(skipped_max_usages),
+                    'new_max_usages': new_max_usages,
+                    'changed_fields_summary': changed_fields_summary,
+                    'bulk_fields': bulk_fields,
+                    'voucher_pks': voucher_pks,
+                    'voucher_group_pks': group_pks,
+                    'tag': tag,
+                    'post_data': request.POST,
+                },
+            )
+
+        elif action == 'save_confirm':
+            # Step 3: Execute updates atomically
+            lockfn = (
+                request.event.lock
+                if ('block_quota' in bulk_fields or 'productvar' in bulk_fields or 'max_usages' in bulk_fields)
+                else NoLockManager
+            )
+            with lockfn(), transaction.atomic():
+                scalar_fields = [f for f in bulk_fields if f not in ('productvar', 'value', 'price_mode')]
+                update_fields = list(scalar_fields)
+                if 'price_mode' in bulk_fields or 'value' in bulk_fields:
+                    update_fields.extend(['price_mode', 'value'])
+                if 'productvar' in bulk_fields:
+                    update_fields.extend(['quota', 'product', 'variation'])
+
+                for v in to_update:
+                    for f in scalar_fields:
+                        setattr(v, f, form.cleaned_data[f])
+                    if 'price_mode' in bulk_fields or 'value' in bulk_fields:
+                        v.price_mode = form.cleaned_data.get('price_mode', v.price_mode)
+                        v.value = form.cleaned_data.get('value')
+                    if 'productvar' in bulk_fields:
+                        v.quota = form.instance.quota
+                        v.product = form.instance.product
+                        v.variation = form.instance.variation
+                    v.save(update_fields=update_fields)
+
+                if 'productvar' in bulk_fields and to_update:
+                    v_ids = [v.pk for v in to_update]
+                    Voucher.limit_products.through.objects.filter(voucher_id__in=v_ids).delete()
+                    Voucher.limit_variations.through.objects.filter(voucher_id__in=v_ids).delete()
+                    if getattr(form, '_limit_products', []):
+                        Voucher.limit_products.through.objects.bulk_create([
+                            Voucher.limit_products.through(voucher_id=vid, product_id=p.pk)
+                            for vid in v_ids for p in form._limit_products
+                        ], batch_size=500)
+                    if getattr(form, '_limit_variations', []):
+                        Voucher.limit_variations.through.objects.bulk_create([
+                            Voucher.limit_variations.through(voucher_id=vid, productvariation_id=var.pk)
+                            for vid in v_ids for var in form._limit_variations
+                        ], batch_size=500)
+
+                # Bulk log entries
+                change_data = {}
+                for f in bulk_fields:
+                    val = form.cleaned_data.get(f)
+                    if isinstance(val, (datetime.datetime, datetime.date)):
+                        val = val.isoformat()
+                    elif hasattr(val, 'pk'):
+                        val = val.pk
+                    elif isinstance(val, decimal.Decimal):
+                        val = str(val)
+                    change_data[f] = val
+                if 'price_mode' in bulk_fields:
+                    val = form.cleaned_data.get('value')
+                    change_data['value'] = str(val) if isinstance(val, decimal.Decimal) else val
+                if 'productvar' in bulk_fields:
+                    change_data['productvar'] = form.cleaned_data.get('productvar')
+
+                log_entries = [
+                    v.log_action('eventyay.voucher.changed', user=request.user, data=change_data, save=False)
+                    for v in to_update
+                ]
+                LogEntry.objects.bulk_create(log_entries, batch_size=200)
+                request.event.cache.clear()
+
+            if to_update:
+                messages.success(
+                    request,
+                    _('Your changes have been saved for {count} vouchers.').format(count=len(to_update)),
+                )
+            else:
+                messages.warning(request, _('No vouchers were updated because all selected vouchers were skipped.'))
+
+            return redirect(self.get_success_url())
+
+        return redirect(self.get_success_url())
+

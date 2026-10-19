@@ -31,7 +31,7 @@ function updateBatchActions(table) {
     form.querySelectorAll('.batch-select-actions').forEach((actions) => {
         actions.classList.toggle('hidden', !hasSelection);
     });
-    form.querySelectorAll('button[name="action"][value="delete"]').forEach((button) => {
+    form.querySelectorAll('button[name="action"][value="delete"], button[name="action"][value="edit"]').forEach((button) => {
         button.classList.toggle('hidden', !hasSelection);
     });
 
@@ -221,19 +221,19 @@ function setGroupSelection(groupCheckbox) {
 }
 
 function syncMemberGroupCheckbox(memberCheckbox) {
-    const memberRow = memberCheckbox.closest(memberRowSelector);
-    if (!memberRow) {
-        return;
-    }
-
     const table = memberCheckbox.closest(voucherTableSelector);
-    const groupCheckbox = table.querySelector(
-        `${groupCheckboxSelector}[data-voucher-group-select="${memberRow.dataset.voucherGroupMember}"]`
-    );
-    if (groupCheckbox) {
-        syncGroupCheckbox(groupCheckbox);
+    const memberRow = memberCheckbox.closest(memberRowSelector);
+    if (memberRow && table) {
+        const groupCheckbox = table.querySelector(
+            `${groupCheckboxSelector}[data-voucher-group-select="${memberRow.dataset.voucherGroupMember}"]`
+        );
+        if (groupCheckbox) {
+            syncGroupCheckbox(groupCheckbox);
+        }
     }
-    updateBatchActions(table);
+    if (table) {
+        updateBatchActions(table);
+    }
 }
 
 document.addEventListener('click', (event) => {

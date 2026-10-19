@@ -192,13 +192,57 @@
                                                 <span class="fa fa-caret-right" aria-hidden="true"></span>
                                                 <strong>{{ v.tag }}</strong>
                                             </a>
+                                            {% if v.group_count %}
+                                                <span class="badge">{{ v.group_count }} {% blocktrans count count=v.group_count %}voucher{% plural %}vouchers{% endblocktrans %}</span>
+                                            {% endif %}
                                         </td>
                                         <td class="list-meta"><span class="category-pill">{{ v.group_redeemed }} / {{ v.group_max_usages }}</span></td>
-                                        <td></td>
-                                        <td></td>
-                                        <td></td>
-                                        {% if request.event.has_subevents %}<td></td>{% endif %}
-                                        <td></td>
+                                        <td>{{ v.valid_until|date }}</td>
+                                        <td class="list-meta">
+                                            {% if v.tag %}<span class="category-pill">{{ v.tag }}</span>{% endif %}
+                                        </td>
+                                        <td>
+                                            {% if v.limit_products.all or v.limit_variations.all %}
+                                                {% for p in v.limit_products.all %}
+                                                    {{ p }}{% if not forloop.last or v.limit_variations.all %}, {% endif %}
+                                                {% endfor %}
+                                                {% for var in v.limit_variations.all %}
+                                                    {{ var.product }} – {{ var }}{% if not forloop.last %}, {% endif %}
+                                                {% endfor %}
+                                            {% elif v.product %}
+                                                {{ v.product }}
+                                                {% if v.variation %}
+                                                    – {{ v.variation }}
+                                                {% endif %}
+                                            {% elif v.quota %}
+                                                {% blocktrans trimmed with quota=v.quota.name %}
+                                                    Any product in quota "{{ quota }}"
+                                                {% endblocktrans %}
+                                            {% else %}
+                                                {% trans "All products" %}
+                                            {% endif %}
+                                            {% if v.seat %}<small class="text-muted">{{ v.seat }}</small>{% endif %}
+                                        </td>
+                                        {% if request.event.has_subevents %}
+                                            <td>
+                                                {% if v.subevent %}
+                                                    {{ v.subevent.name }} – {{ v.subevent.get_date_range_display }}
+                                                    {% if request.event.settings.show_times %}
+                                                        {{ v.subevent.date_from|date:"TIME_FORMAT" }}
+                                                    {% endif %}
+                                                {% endif %}
+                                            </td>
+                                        {% endif %}
+                                        <td class="list-actions text-right flip">
+                                            <a href="{% url 'control:event.vouchers.bulk_edit' organizer=request.event.organizer.slug event=request.event.slug %}?voucher_group={{ v.pk }}"
+                                               class="btn btn-sm btn-default" title="{% trans 'Edit group' %}" data-toggle="tooltip">
+                                                <i class="fa fa-tag"></i>
+                                            </a>
+                                            <a href="{% url 'control:event.voucher.delete_group' organizer=request.event.organizer.slug event=request.event.slug voucher=v.pk %}"
+                                               class="btn btn-delete btn-danger btn-sm" title="{% trans 'Delete group' %}" data-toggle="tooltip">
+                                                <i class="fa fa-trash"></i>
+                                            </a>
+                                        </td>
                                     </tr>
                                 {% else %}
                                     {% include 'pretixcontrol/vouchers/_voucher_row.html' with v=v %}
@@ -209,6 +253,9 @@
                         </div>
                         {% if "can_change_vouchers" in request.eventpermset %}
                             <div class="batch-select-actions hidden">
+                                <button type="submit" class="btn btn-default" name="action" value="edit">
+                                    {% trans "Edit selected" %}
+                                </button>
                                 <button type="submit" class="btn btn-default btn-save" name="action" value="delete">
                                     {% trans "Delete selected" %}
                                 </button>

@@ -1,0 +1,80 @@
+{% extends "pretixcontrol/items/base.html" %}
+{% load i18n %}
+{% load bootstrap3 %}
+{% block title %}{% trans "Update vouchers" %}{% endblock %}
+{% block inside %}
+    <h1>{% trans "Update vouchers" %}</h1>
+
+    <div class="panel panel-default">
+        <div class="panel-heading">
+            <h3 class="panel-title">{% trans "Review changes before saving" %}</h3>
+        </div>
+        <div class="panel-body">
+            <ul>
+                <li>
+                    {% blocktrans count count=to_update_count %}
+                        <strong>{{ count }} voucher</strong> will be updated.
+                    {% plural %}
+                        <strong>{{ count }} vouchers</strong> will be updated.
+                    {% endblocktrans %}
+                    {% if changed_fields_summary %}
+                        <ul>
+                            {% for label, val in changed_fields_summary %}
+                                <li><strong>{{ label }}:</strong> {{ val }}</li>
+                            {% endfor %}
+                        </ul>
+                    {% endif %}
+                </li>
+
+                {% if skipped_fully_used_count or skipped_max_usages_count %}
+                    <li>
+                        <strong>{% trans "Skipped vouchers:" %}</strong>
+                        <ul>
+                            {% if skipped_fully_used_count %}
+                                <li>
+                                    {% blocktrans count count=skipped_fully_used_count %}
+                                        {{ count }} voucher is fully used and will not be changed.
+                                    {% plural %}
+                                        {{ count }} vouchers are fully used and will not be changed.
+                                    {% endblocktrans %}
+                                </li>
+                            {% endif %}
+                            {% if skipped_max_usages_count %}
+                                <li>
+                                    {% blocktrans count count=skipped_max_usages_count trimmed with new=new_max_usages %}
+                                        {{ count }} voucher has more redemptions than the new maximum usages ({{ new }}) and cannot be decreased.
+                                    {% plural %}
+                                        {{ count }} vouchers have more redemptions than the new maximum usages ({{ new }}) and cannot be decreased.
+                                    {% endblocktrans %}
+                                </li>
+                            {% endif %}
+                        </ul>
+                    </li>
+                {% endif %}
+            </ul>
+            <p class="text-muted">
+                {% trans "Existing orders are not affected." %}
+            </p>
+        </div>
+    </div>
+
+    <form action="" method="post" class="form-horizontal">
+        {% csrf_token %}
+        {% for key, values in post_data.lists %}
+            {% if key != 'csrfmiddlewaretoken' and key != 'action' %}
+                {% for val in values %}
+                    <input type="hidden" name="{{ key }}" value="{{ val }}">
+                {% endfor %}
+            {% endif %}
+        {% endfor %}
+
+        <div class="form-group submit-group">
+            <button type="submit" class="btn btn-default" name="action" value="edit">
+                {% trans "Back" %}
+            </button>
+            <button type="submit" class="btn btn-primary btn-save" name="action" value="save_confirm" {% if to_update_count == 0 %}disabled{% endif %}>
+                {% trans "Confirm and save" %}
+            </button>
+        </div>
+    </form>
+{% endblock %}
