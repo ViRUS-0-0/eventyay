@@ -725,6 +725,16 @@ class VoucherBulkEditForm(VoucherForm):
                 'price_mode': eff_price_mode,
                 'value': eff_value,
                 'budget': eff_budget,
+                'all_addons_included': (
+                    data.get('all_addons_included', False)
+                    if 'all_addons_included' in bulk_fields
+                    else getattr(v, 'all_addons_included', False)
+                ),
+                'all_bundles_included': (
+                    data.get('all_bundles_included', False)
+                    if 'all_bundles_included' in bulk_fields
+                    else getattr(v, 'all_bundles_included', False)
+                ),
                 'allow_ignore_quota': (
                     data.get('allow_ignore_quota', False)
                     if 'allow_ignore_quota' in bulk_fields

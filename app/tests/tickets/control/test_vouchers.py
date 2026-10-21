@@ -1180,4 +1180,94 @@ class VoucherFilterEmptyStateTest(SoupTestMixin, TestCase):
         content = response.content.decode()
         assert 'You can only block quota if you specify a specific product variation' in content
 
+    def test_voucher_bulk_edit_validates_budget_with_addons_included(self):
+        with scopes_disabled():
+            self.event.vouchers.create(
+                product=self.ticket,
+                code='ADDON_BUDGET',
+                tag='addon-tag',
+                all_addons_included=True,
+            )
+        response = self.client.post(
+            f'/control/event/{self.orga.slug}/{self.event.slug}/vouchers/bulk_edit',
+            {
+                'action': 'save',
+                'target_tag': 'addon-tag',
+                '_bulk': ['budget'],
+                'budget': '50.00',
+            },
+        )
+        assert response.status_code == 200
+        content = response.content.decode()
+        assert 'A discount budget cannot be combined with free add-on' in content
+
+    def test_voucher_list_group_row_non_uniform_variations_and_limits_shows_varies(self):
+        with scopes_disabled():
+            shirt = Item.objects.create(event=self.event, name='Shirt vars', default_price=10)
+            v_red = shirt.variations.create(value='Red')
+            v_blue = shirt.variations.create(value='Blue')
+            self.event.vouchers.create(product=shirt, variation=v_red, code='SH_RED', tag='var-group')
+            self.event.vouchers.create(product=shirt, variation=v_blue, code='SH_BLUE', tag='var-group')
+
+            shirt2 = Item.objects.create(event=self.event, name='Shirt limits', default_price=10)
+            v_lim = self.event.vouchers.create(code='LIM1', tag='limit-group')
+            v_lim.limit_products.add(shirt2)
+            self.event.vouchers.create(code='LIM2', tag='limit-group')
+
+        response = self.client.get(f'/control/event/{self.orga.slug}/{self.event.slug}/vouchers/')
+        assert response.status_code == 200
+        content = response.content.decode()
+        assert 'var-group' in content
+        assert 'limit-group' in content
+        assert 'Varies' in content
+
+    def test_voucher_bulk_edit_multi_group_selection_succeeds(self):
+        with scopes_disabled():
+            v1 = self.event.vouchers.create(product=self.ticket, code='MG1', tag='grp-1', max_usages=1)
+            v2 = self.event.vouchers.create(product=self.ticket, code='MG2', tag='grp-2', max_usages=1)
+        response = self.client.post(
+            f'/control/event/{self.orga.slug}/{self.event.slug}/vouchers/bulk_edit',
+            {
+                'action': 'save_confirm',
+                'voucher_group': [v1.pk, v2.pk],
+                '_bulk': ['max_usages'],
+                'max_usages': '5',
+            },
+        )
+        assert response.status_code == 302
+        with scopes_disabled():
+            v1.refresh_from_db()
+            v2.refresh_from_db()
+            assert v1.max_usages == 5
+            assert v2.max_usages == 5
+
+    def test_voucher_bulk_edit_grouped_quota_check_rejects_exceeded_quota(self):
+        with scopes_disabled():
+            q1 = Quota.objects.create(event=self.event, name='Q1', size=5)
+            q2 = Quota.objects.create(event=self.event, name='Q2', size=0)
+            item1 = Item.objects.create(event=self.event, name='Item 1', default_price=10)
+            item2 = Item.objects.create(event=self.event, name='Item 2', default_price=10)
+            q1.products.add(item1)
+            q2.products.add(item2)
+            v1 = self.event.vouchers.create(product=item1, code='GQ1', tag='gq-tag', block_quota=False)
+            v2 = self.event.vouchers.create(product=item2, code='GQ2', tag='gq-tag', block_quota=False)
+        response = self.client.post(
+            f'/control/event/{self.orga.slug}/{self.event.slug}/vouchers/bulk_edit',
+            {
+                'action': 'save_confirm',
+                'target_tag': 'gq-tag',
+                '_bulk': ['block_quota'],
+                'block_quota': 'on',
+            },
+        )
+        assert response.status_code == 302
+        messages = [m.message for m in response.wsgi_request._messages]
+        assert any('sold out' in m or 'completely reserved' in m for m in messages)
+        with scopes_disabled():
+            v1.refresh_from_db()
+            v2.refresh_from_db()
+            assert not v1.block_quota
+            assert not v2.block_quota
+
+
 

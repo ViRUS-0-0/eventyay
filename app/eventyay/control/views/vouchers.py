@@ -84,6 +84,14 @@ class VoucherList(PaginationMixin, EventPermissionRequiredMixin, ListView):
         vouchers = list(ctx['vouchers'])
         group_tags = {voucher.tag for voucher in vouchers if voucher.tag}
         if group_tags:
+            tags_with_limits = set(
+                self.request.event.vouchers.filter(
+                    waitinglistentries__isnull=True,
+                    tag__in=group_tags,
+                )
+                .filter(Q(limit_products__isnull=False) | Q(limit_variations__isnull=False))
+                .values_list('tag', flat=True)
+            )
             group_totals = {
                 total['tag']: total
                 for total in self.request.event.vouchers.filter(waitinglistentries__isnull=True, tag__in=group_tags)
@@ -97,6 +105,10 @@ class VoucherList(PaginationMixin, EventPermissionRequiredMixin, ListView):
                     null_dates=Count(Case(When(valid_until__isnull=True, then=1))),
                     distinct_products=Count('product', distinct=True),
                     null_products=Count(Case(When(product__isnull=True, then=1))),
+                    distinct_variations=Count('variation', distinct=True),
+                    null_variations=Count(Case(When(variation__isnull=True, then=1))),
+                    distinct_quotas=Count('quota', distinct=True),
+                    null_quotas=Count(Case(When(quota__isnull=True, then=1))),
                     distinct_subevents=Count('subevent', distinct=True),
                     null_subevents=Count(Case(When(subevent__isnull=True, then=1))),
                 )
@@ -110,7 +122,15 @@ class VoucherList(PaginationMixin, EventPermissionRequiredMixin, ListView):
                     null_date_flag = 1 if (total and total['null_dates'] > 0) else 0
                     voucher.uniform_date = (total['distinct_dates'] + null_date_flag <= 1) if total else True
                     null_prod_flag = 1 if (total and total['null_products'] > 0) else 0
-                    voucher.uniform_product = (total['distinct_products'] + null_prod_flag <= 1) if total else True
+                    null_var_flag = 1 if (total and total['null_variations'] > 0) else 0
+                    null_quota_flag = 1 if (total and total['null_quotas'] > 0) else 0
+                    prod_uniform = (total['distinct_products'] + null_prod_flag <= 1) if total else True
+                    var_uniform = (total['distinct_variations'] + null_var_flag <= 1) if total else True
+                    quota_uniform = (total['distinct_quotas'] + null_quota_flag <= 1) if total else True
+                    no_limits = voucher.tag not in tags_with_limits
+                    voucher.uniform_product = bool(
+                        total and no_limits and prod_uniform and var_uniform and quota_uniform
+                    ) if total else True
                     null_sub_flag = 1 if (total and total['null_subevents'] > 0) else 0
                     voucher.uniform_subevent = (total['distinct_subevents'] + null_sub_flag <= 1) if total else True
 
@@ -776,7 +796,11 @@ class VoucherBulkEdit(EventPermissionRequiredMixin, View):
         if not qs_filter:
             return self.request.event.vouchers.none()
 
-        return self.request.event.vouchers.filter(qs_filter, waitinglistentries__isnull=True).distinct()
+        return (
+            self.request.event.vouchers.filter(qs_filter, waitinglistentries__isnull=True)
+            .distinct()
+            .prefetch_related('limit_products', 'limit_variations', 'limit_variations__product')
+        )
 
     def get_success_url(self) -> str:
         return reverse(
@@ -797,12 +821,13 @@ class VoucherBulkEdit(EventPermissionRequiredMixin, View):
         sample = vouchers[0] if vouchers else Voucher(event=request.event)
         group_pks = request.GET.getlist('voucher_group') or request.POST.getlist('voucher_group')
         voucher_pks = request.GET.getlist('voucher') or request.POST.getlist('voucher')
+        distinct_group_pks = set(group_pks)
         target_tag = (
             request.GET.get('target_tag')
             or request.POST.get('target_tag')
             or request.GET.get('tag')
         )
-        if not target_tag and group_pks and sample.tag:
+        if not target_tag and len(distinct_group_pks) == 1 and sample.tag:
             target_tag = sample.tag
 
         bulk_selected = request.POST.getlist('_bulk') if request.method == 'POST' else []
@@ -880,9 +905,12 @@ class VoucherBulkEdit(EventPermissionRequiredMixin, View):
 
         group_pks = request.POST.getlist('voucher_group')
         voucher_pks = request.POST.getlist('voucher')
+        distinct_group_pks = set(group_pks)
         expected_tag = request.POST.get('original_tag')
-        if action == 'save_confirm' and group_pks and expected_tag:
-            current_tags = set(self.request.event.vouchers.filter(pk__in=group_pks).values_list('tag', flat=True))
+        if action == 'save_confirm' and len(distinct_group_pks) == 1 and expected_tag:
+            current_tags = set(
+                self.request.event.vouchers.filter(pk__in=distinct_group_pks).values_list('tag', flat=True)
+            )
             if current_tags != {expected_tag}:
                 messages.error(request, _('The voucher group was modified. Please try again.'))
                 return redirect(self.get_success_url())
@@ -926,7 +954,7 @@ class VoucherBulkEdit(EventPermissionRequiredMixin, View):
                 or request.GET.get('target_tag')
                 or request.GET.get('tag')
             )
-            if not target_tag and group_pks and sample.tag:
+            if not target_tag and len(distinct_group_pks) == 1 and sample.tag:
                 target_tag = sample.tag
 
             return render(
@@ -951,7 +979,11 @@ class VoucherBulkEdit(EventPermissionRequiredMixin, View):
             with request.event.lock(), transaction.atomic():
                 # Re-fetch under row lock to reclassify live redemption counts
                 target_ids = list(self.target_vouchers.values_list('pk', flat=True))
-                fresh_vouchers = list(self.request.event.vouchers.filter(pk__in=target_ids).select_for_update())
+                fresh_vouchers = list(
+                    self.request.event.vouchers.filter(pk__in=target_ids)
+                    .select_for_update()
+                    .prefetch_related('limit_products', 'limit_variations', 'limit_variations__product')
+                )
                 to_update = []
                 skipped_fully_used = []
                 skipped_max_usages = []
@@ -963,16 +995,8 @@ class VoucherBulkEdit(EventPermissionRequiredMixin, View):
                     else:
                         to_update.append(v)
 
-                # Quota check under lock using summed max_usages delta
-                total_quota_delta = 0
-                sample_v_data = None
-                sample_old_inst = None
-                sample_eff_quota = None
-                sample_eff_prod = None
-                sample_eff_var = None
-                sample_eff_limit_p = None
-                sample_eff_limit_v = None
-
+                # Quota check under lock grouped by effective quota, product, variation, subevent, and limits
+                quota_groups = {}
                 for v in to_update:
                     eff_quota = form.instance.quota if 'productvar' in bulk_fields else v.quota
                     eff_product = form.instance.product if 'productvar' in bulk_fields else v.product
@@ -1022,40 +1046,55 @@ class VoucherBulkEdit(EventPermissionRequiredMixin, View):
                     product_changed = 'productvar' in bulk_fields and (
                         eff_quota != v.quota or eff_product != v.product or eff_variation != v.variation
                     )
-                    if Voucher.clean_quota_needs_checking(v_data, v, product_changed=product_changed, creating=False):
-                        total_quota_delta += eff_max_usages
-                        if sample_v_data is None:
-                            sample_v_data, sample_old_inst = v_data, v
-                            sample_eff_quota = eff_quota
-                            sample_eff_prod = eff_product
-                            sample_eff_var = eff_variation
-                            sample_eff_limit_p, sample_eff_limit_v = eff_limit_p, eff_limit_v
+                    delta = 0
+                    is_new_blocker = Voucher.clean_quota_needs_checking(
+                        v_data, v, product_changed=product_changed, creating=False
+                    )
+                    if is_new_blocker:
+                        delta = max(0, eff_max_usages - v.redeemed)
                     elif eff_block_quota and (v_data['valid_until'] is None or v_data['valid_until'] >= now()):
                         if 'max_usages' in bulk_fields and eff_max_usages > v.max_usages:
-                            total_quota_delta += (eff_max_usages - v.max_usages)
-                            if sample_v_data is None:
-                                sample_v_data, sample_old_inst = v_data, None
-                                sample_eff_quota = eff_quota
-                                sample_eff_prod = eff_product
-                                sample_eff_var = eff_variation
-                                sample_eff_limit_p, sample_eff_limit_v = eff_limit_p, eff_limit_v
+                            delta = eff_max_usages - v.max_usages
 
-                if total_quota_delta > 0 and sample_v_data:
-                    try:
-                        Voucher.clean_quota_check(
-                            sample_v_data,
-                            total_quota_delta,
-                            sample_old_inst,
-                            request.event,
-                            sample_eff_quota,
-                            sample_eff_prod,
-                            sample_eff_var,
-                            limit_products=sample_eff_limit_p,
-                            limit_variations=sample_eff_limit_v,
+                    if delta > 0:
+                        group_key = (
+                            eff_quota.pk if eff_quota else None,
+                            eff_product.pk if eff_product else None,
+                            eff_variation.pk if eff_variation else None,
+                            eff_subevent.pk if eff_subevent else None,
+                            tuple(sorted(p.pk for p in eff_limit_p)),
+                            tuple(sorted(var.pk for var in eff_limit_v)),
                         )
-                    except ValidationError as e:
-                        messages.error(request, ' '.join(e.messages) if hasattr(e, 'messages') else str(e))
-                        return redirect(self.get_success_url())
+                        if group_key not in quota_groups:
+                            quota_groups[group_key] = {
+                                'delta': 0,
+                                'sample_v_data': v_data,
+                                'sample_old_inst': v if is_new_blocker else None,
+                                'eff_quota': eff_quota,
+                                'eff_product': eff_product,
+                                'eff_variation': eff_variation,
+                                'eff_limit_p': eff_limit_p,
+                                'eff_limit_v': eff_limit_v,
+                            }
+                        quota_groups[group_key]['delta'] += delta
+
+                for group in quota_groups.values():
+                    if group['delta'] > 0 and group['sample_v_data']:
+                        try:
+                            Voucher.clean_quota_check(
+                                group['sample_v_data'],
+                                group['delta'],
+                                group['sample_old_inst'],
+                                request.event,
+                                group['eff_quota'],
+                                group['eff_product'],
+                                group['eff_variation'],
+                                limit_products=group['eff_limit_p'],
+                                limit_variations=group['eff_limit_v'],
+                            )
+                        except ValidationError as e:
+                            messages.error(request, ' '.join(e.messages) if hasattr(e, 'messages') else str(e))
+                            return redirect(self.get_success_url())
 
                 scalar_fields = [f for f in bulk_fields if f not in ('productvar', 'value', 'price_mode')]
                 update_fields = list(scalar_fields)
