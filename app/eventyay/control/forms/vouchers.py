@@ -701,7 +701,11 @@ class VoucherBulkEditForm(VoucherForm):
             elif 'price_mode' in bulk_fields and data.get('value') is None:
                 self.add_error('value', _('Please enter a value for the selected price effect.'))
 
-        targets = self.target_vouchers or [self.instance]
+        targets = (
+            [v for v in self.target_vouchers if v.redeemed < v.max_usages]
+            if self.target_vouchers
+            else [self.instance]
+        )
         for v in targets:
             eff_quota = getattr(self.instance, 'quota', None) if 'productvar' in bulk_fields else v.quota
             eff_product = getattr(self.instance, 'product', None) if 'productvar' in bulk_fields else v.product

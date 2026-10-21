@@ -1086,7 +1086,7 @@ class VoucherFilterEmptyStateTest(SoupTestMixin, TestCase):
             assert v_fully.comment == ''
 
             logs = list(v_unused.all_logentries())
-            assert any(l.action_type == 'eventyay.voucher.changed' for l in logs)
+            assert any(entry.action_type == 'eventyay.voucher.changed' for entry in logs)
 
     def test_voucher_group_delete_get_and_post(self):
         with scopes_disabled():
@@ -1287,6 +1287,42 @@ class VoucherFilterEmptyStateTest(SoupTestMixin, TestCase):
             v2.refresh_from_db()
             assert not v1.block_quota
             assert not v2.block_quota
+
+    def test_voucher_bulk_edit_skips_fully_used_vouchers_during_validation(self):
+        with scopes_disabled():
+            shirt = Item.objects.create(event=self.event, name='Shirt with vars 2', default_price=10)
+            shirt.variations.create(value='Blue')
+            # Fully used voucher that would fail block_quota validation without variation if not skipped
+            self.event.vouchers.create(
+                product=shirt,
+                code='VAR_USED',
+                tag='skip-used-tag',
+                block_quota=False,
+                max_usages=1,
+                redeemed=1,
+            )
+            # Eligible unused voucher
+            self.event.vouchers.create(
+                product=self.ticket,
+                code='TICKET_UNUSED',
+                tag='skip-used-tag',
+                block_quota=False,
+                max_usages=1,
+                redeemed=0,
+            )
+        response = self.client.post(
+            f'/control/event/{self.orga.slug}/{self.event.slug}/vouchers/bulk_edit',
+            {
+                'action': 'save',
+                'target_tag': 'skip-used-tag',
+                '_bulk': ['block_quota'],
+                'block_quota': 'on',
+            },
+        )
+        assert response.status_code == 200
+        content = response.content.decode()
+        assert 'Review changes before saving' in content
+        assert '1 voucher is fully used' in content
 
 
 
