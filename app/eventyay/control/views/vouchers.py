@@ -1107,16 +1107,20 @@ class VoucherBulkEdit(EventPermissionRequiredMixin, View):
 
                 scalar_fields = [f for f in bulk_fields if f not in ('productvar', 'value', 'price_mode')]
                 update_fields = list(scalar_fields)
-                if 'price_mode' in bulk_fields or 'value' in bulk_fields:
+                if 'price_mode' in bulk_fields:
                     update_fields.extend(['price_mode', 'value'])
+                elif 'value' in bulk_fields:
+                    update_fields.append('value')
                 if 'productvar' in bulk_fields:
                     update_fields.extend(['quota', 'product', 'variation'])
 
                 for v in to_update:
                     for f in scalar_fields:
                         setattr(v, f, form.cleaned_data[f])
-                    if 'price_mode' in bulk_fields or 'value' in bulk_fields:
-                        v.price_mode = form.cleaned_data.get('price_mode', v.price_mode)
+                    if 'price_mode' in bulk_fields:
+                        v.price_mode = form.cleaned_data['price_mode']
+                        v.value = None if v.price_mode == 'none' else form.cleaned_data.get('value')
+                    elif 'value' in bulk_fields:
                         v.value = form.cleaned_data.get('value')
                     if 'productvar' in bulk_fields:
                         v.quota = form.instance.quota

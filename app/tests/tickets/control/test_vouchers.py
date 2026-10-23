@@ -8,6 +8,7 @@ from django.utils.timezone import now
 from django_scopes import scopes_disabled
 
 from eventyay.control.forms.admin.vouchers import InvoiceVoucherForm
+from eventyay.control.forms.vouchers import VoucherBulkEditForm
 from eventyay.multidomain.urlreverse import build_absolute_uri
 
 from eventyay.base.models import (
@@ -1323,6 +1324,72 @@ class VoucherFilterEmptyStateTest(SoupTestMixin, TestCase):
         content = response.content.decode()
         assert 'Review changes before saving' in content
         assert '1 voucher is fully used' in content
+
+    def test_voucher_bulk_edit_form_removes_code_and_seat_fields(self):
+        with scopes_disabled():
+            v = self.event.vouchers.create(product=self.ticket, code='CODE_SEAT', tag='cs-tag')
+        form = VoucherBulkEditForm(instance=v, target_vouchers=[v])
+        assert 'code' not in form.fields
+        assert 'seat' not in form.fields
+
+    def test_voucher_bulk_edit_value_only_preserves_price_mode(self):
+        with scopes_disabled():
+            v1 = self.event.vouchers.create(
+                product=self.ticket,
+                code='VAL_PCT',
+                tag='val-tag',
+                price_mode='percent',
+                value=decimal.Decimal('10.00'),
+            )
+            v2 = self.event.vouchers.create(
+                product=self.ticket,
+                code='VAL_SET',
+                tag='val-tag',
+                price_mode='set',
+                value=decimal.Decimal('20.00'),
+            )
+        response = self.client.post(
+            f'/control/event/{self.orga.slug}/{self.event.slug}/vouchers/bulk_edit',
+            {
+                'action': 'save_confirm',
+                'target_tag': 'val-tag',
+                '_bulk': ['value'],
+                'value': '15.00',
+            },
+        )
+        assert response.status_code == 302
+        with scopes_disabled():
+            v1.refresh_from_db()
+            v2.refresh_from_db()
+            assert v1.price_mode == 'percent'
+            assert v1.value == decimal.Decimal('15.00')
+            assert v2.price_mode == 'set'
+            assert v2.value == decimal.Decimal('15.00')
+
+    def test_voucher_bulk_edit_price_mode_none_clears_value(self):
+        with scopes_disabled():
+            v = self.event.vouchers.create(
+                product=self.ticket,
+                code='PM_NONE',
+                tag='none-tag',
+                price_mode='percent',
+                value=decimal.Decimal('10.00'),
+            )
+        response = self.client.post(
+            f'/control/event/{self.orga.slug}/{self.event.slug}/vouchers/bulk_edit',
+            {
+                'action': 'save_confirm',
+                'target_tag': 'none-tag',
+                '_bulk': ['price_mode'],
+                'price_mode': 'none',
+                'value': '10.00',
+            },
+        )
+        assert response.status_code == 302
+        with scopes_disabled():
+            v.refresh_from_db()
+            assert v.price_mode == 'none'
+            assert v.value is None
 
 
 

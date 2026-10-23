@@ -666,8 +666,8 @@ class VoucherBulkEditForm(VoucherForm):
     def __init__(self, *args, target_vouchers=None, **kwargs):
         self.target_vouchers = list(target_vouchers) if target_vouchers is not None else []
         super().__init__(*args, **kwargs)
-        if 'code' in self.fields:
-            del self.fields['code']
+        self.fields.pop('code', None)
+        self.fields.pop('seat', None)
         for field in self.fields.values():
             field.required = False
             if hasattr(field, 'one_required'):
@@ -696,9 +696,9 @@ class VoucherBulkEditForm(VoucherForm):
                 self.add_error('max_usages', _('Maximum usages must be at least 1.'))
 
         if 'price_mode' in bulk_fields or 'value' in bulk_fields or 'budget' in bulk_fields:
-            if data.get('price_mode') == 'none':
+            if 'price_mode' in bulk_fields and data.get('price_mode') == 'none':
                 data['value'] = None
-            elif 'price_mode' in bulk_fields and data.get('value') is None:
+            elif ('price_mode' in bulk_fields or 'value' in bulk_fields) and data.get('value') is None:
                 self.add_error('value', _('Please enter a value for the selected price effect.'))
 
         targets = (
