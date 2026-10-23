@@ -698,7 +698,7 @@ class VoucherBulkEditForm(VoucherForm):
         if 'price_mode' in bulk_fields or 'value' in bulk_fields or 'budget' in bulk_fields:
             if 'price_mode' in bulk_fields and data.get('price_mode') == 'none':
                 data['value'] = None
-            elif ('price_mode' in bulk_fields or 'value' in bulk_fields) and data.get('value') is None:
+            elif 'value' in bulk_fields and data.get('value') is None:
                 self.add_error('value', _('Please enter a value for the selected price effect.'))
 
         targets = (
@@ -752,14 +752,24 @@ class VoucherBulkEditForm(VoucherForm):
                 if 'budget' in bulk_fields
                 else getattr(v, 'budget', None)
             )
+            eff_show_hidden = (
+                data.get('show_hidden_products')
+                if 'show_hidden_products' in bulk_fields
+                else getattr(v, 'show_hidden_products', False)
+            )
 
-            v_data = {
+            v_data = dict(data)
+            v_data.update({
+                'quota': eff_quota,
+                'product': eff_product,
+                'variation': eff_variation,
                 'block_quota': eff_block_quota,
                 'subevent': eff_subevent,
                 'valid_until': eff_valid_until,
                 'price_mode': eff_price_mode,
                 'value': eff_value,
                 'budget': eff_budget,
+                'show_hidden_products': eff_show_hidden,
                 'all_addons_included': (
                     data.get('all_addons_included', False)
                     if 'all_addons_included' in bulk_fields
@@ -775,7 +785,7 @@ class VoucherBulkEditForm(VoucherForm):
                     if 'allow_ignore_quota' in bulk_fields
                     else getattr(v, 'allow_ignore_quota', False)
                 ),
-            }
+            })
             try:
                 Voucher.clean_subevent(v_data, self.instance.event)
                 Voucher.clean_product_properties(
@@ -790,8 +800,31 @@ class VoucherBulkEditForm(VoucherForm):
                     limit_variations=eff_limit_variations,
                 )
                 Voucher.clean_value_and_budget(v_data)
+                if not eff_show_hidden:
+                    limited = eff_limit_products or eff_limit_variations
+                    all_limits_hidden = bool(limited) and all(
+                        i.hide_without_voucher for i in eff_limit_products
+                    ) and all(var.product.hide_without_voucher for var in eff_limit_variations)
+                    if (
+                        (eff_quota and all(i.hide_without_voucher for i in eff_quota.products.all()))
+                        or (eff_product and eff_product.hide_without_voucher)
+                        or all_limits_hidden
+                    ):
+                        raise ValidationError(
+                            {
+                                'show_hidden_products': [
+                                    _(
+                                        'The voucher only matches hidden products but you have not selected that it '
+                                        'should show them.'
+                                    )
+                                ]
+                            }
+                        )
+                voucher_form_validation.send(sender=self.instance.event, form=self, data=v_data)
             except ValidationError as e:
                 self.add_error(None, e)
+                break
+            if self.errors:
                 break
 
         return data

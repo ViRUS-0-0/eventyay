@@ -1391,5 +1391,116 @@ class VoucherFilterEmptyStateTest(SoupTestMixin, TestCase):
             assert v.price_mode == 'none'
             assert v.value is None
 
+    def test_voucher_bulk_edit_price_mode_only_preserves_existing_value(self):
+        with scopes_disabled():
+            v = self.event.vouchers.create(
+                product=self.ticket,
+                code='PM_ONLY',
+                tag='pmo-tag',
+                price_mode='percent',
+                value=decimal.Decimal('10.00'),
+            )
+        response = self.client.post(
+            f'/control/event/{self.orga.slug}/{self.event.slug}/vouchers/bulk_edit',
+            {
+                'action': 'save_confirm',
+                'target_tag': 'pmo-tag',
+                '_bulk': ['price_mode'],
+                'price_mode': 'set',
+            },
+        )
+        assert response.status_code == 302
+        with scopes_disabled():
+            v.refresh_from_db()
+            assert v.price_mode == 'set'
+            assert v.value == decimal.Decimal('10.00')
+
+    def test_voucher_bulk_edit_validates_hidden_products(self):
+        with scopes_disabled():
+            hidden_item = Item.objects.create(
+                event=self.event,
+                name='Secret VIP',
+                default_price=100,
+                hide_without_voucher=True,
+            )
+            self.event.vouchers.create(
+                product=self.ticket,
+                code='HIDDEN_TEST',
+                tag='hidden-tag',
+                show_hidden_products=False,
+            )
+        response = self.client.post(
+            f'/control/event/{self.orga.slug}/{self.event.slug}/vouchers/bulk_edit',
+            {
+                'action': 'save',
+                'target_tag': 'hidden-tag',
+                '_bulk': ['productvar'],
+                'productvar': str(hidden_item.pk),
+            },
+        )
+        assert response.status_code == 200
+        content = response.content.decode()
+        assert 'The voucher only matches hidden products but you have not selected that it should show them.' in content
+
+        response = self.client.post(
+            f'/control/event/{self.orga.slug}/{self.event.slug}/vouchers/bulk_edit',
+            {
+                'action': 'save',
+                'target_tag': 'hidden-tag',
+                '_bulk': ['productvar', 'show_hidden_products'],
+                'productvar': str(hidden_item.pk),
+                'show_hidden_products': 'on',
+            },
+        )
+        assert response.status_code == 200
+        content = response.content.decode()
+        assert 'Review changes before saving' in content
+
+    def test_voucher_list_view_only_user_does_not_see_group_edit_or_delete(self):
+        with scopes_disabled():
+            view_user = User.objects.create_user('viewonly@dummy.dummy', 'dummy')
+            view_team = Team.objects.create(organizer=self.orga, can_view_vouchers=True, can_change_vouchers=False)
+            view_team.members.add(view_user)
+            view_team.limit_events.add(self.event)
+            self.event.vouchers.create(product=self.ticket, code='GRP_V1', tag='view-group')
+            self.event.vouchers.create(product=self.ticket, code='GRP_V2', tag='view-group')
+        self.client.login(email='viewonly@dummy.dummy', password='dummy')
+        response = self.client.get(f'/control/event/{self.orga.slug}/{self.event.slug}/vouchers/')
+        assert response.status_code == 200
+        content = response.content.decode()
+        assert 'view-group' in content
+        assert 'title="Edit group"' not in content
+        assert 'title="Delete group"' not in content
+
+    def test_voucher_bulk_edit_fires_voucher_form_validation_signal(self):
+        from django.core.exceptions import ValidationError
+
+        from eventyay.control.signals import voucher_form_validation
+
+        def reject_receiver(sender, form, data, **kwargs):
+            if data.get('comment') == 'forbidden':
+                raise ValidationError('Plugin rejected bulk edit')
+
+        reject_receiver.__module__ = 'eventyay.control'
+
+        voucher_form_validation.connect(reject_receiver)
+        try:
+            with scopes_disabled():
+                self.event.vouchers.create(product=self.ticket, code='SIG_TEST', tag='sig-tag')
+            response = self.client.post(
+                f'/control/event/{self.orga.slug}/{self.event.slug}/vouchers/bulk_edit',
+                {
+                    'action': 'save',
+                    'target_tag': 'sig-tag',
+                    '_bulk': ['comment'],
+                    'comment': 'forbidden',
+                },
+            )
+            assert response.status_code == 200
+            content = response.content.decode()
+            assert 'Plugin rejected bulk edit' in content
+        finally:
+            voucher_form_validation.disconnect(reject_receiver)
+
 
 

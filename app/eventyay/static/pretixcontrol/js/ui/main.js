@@ -1236,25 +1236,6 @@ $(function () {
         return false;
     });
 
-    // Voucher page specific batch action toggle (delete & edit selected)
-    var $vouchersBatchBtns = $('button[name="action"][value="delete"], button[name="action"][value="edit"]');
-    var $vouchersForm = $vouchersBatchBtns.closest('form');
-    // Only run this behavior on the voucher list (other pages also use .table-quotas + a delete button).
-    if ($vouchersForm.length) {
-        var updateVouchersBatchBtns = function () {
-            var $vouchersCheckboxes = $vouchersForm.find('input[name="voucher"], input[name="voucher_group"]');
-            var hasSelection = $vouchersCheckboxes.filter(':checked').length > 0;
-            $vouchersBatchBtns.toggleClass('hidden', !hasSelection);
-            $vouchersForm.find('.batch-select-actions').toggleClass('hidden', !hasSelection);
-        };
-
-        $vouchersForm.on('change', 'input[name="voucher"], input[name="voucher_group"], input[data-toggle-table]', function () {
-            setTimeout(updateVouchersBatchBtns, 50);
-        });
-
-        updateVouchersBatchBtns();
-    }
-
     $("#ajaxerr").on("click", ".ajaxerr-close", ajaxErrDialog.hide);
     moment.locale($("body").attr("data-datetimelocale"));
 });

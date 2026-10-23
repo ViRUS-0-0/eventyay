@@ -1119,7 +1119,10 @@ class VoucherBulkEdit(EventPermissionRequiredMixin, View):
                         setattr(v, f, form.cleaned_data[f])
                     if 'price_mode' in bulk_fields:
                         v.price_mode = form.cleaned_data['price_mode']
-                        v.value = None if v.price_mode == 'none' else form.cleaned_data.get('value')
+                        if v.price_mode == 'none':
+                            v.value = None
+                        elif 'value' in bulk_fields:
+                            v.value = form.cleaned_data.get('value')
                     elif 'value' in bulk_fields:
                         v.value = form.cleaned_data.get('value')
                     if 'productvar' in bulk_fields:
@@ -1154,7 +1157,9 @@ class VoucherBulkEdit(EventPermissionRequiredMixin, View):
                     elif isinstance(val, decimal.Decimal):
                         val = str(val)
                     change_data[f] = val
-                if 'price_mode' in bulk_fields:
+                if 'price_mode' in bulk_fields and form.cleaned_data.get('price_mode') == 'none':
+                    change_data['value'] = None
+                elif 'price_mode' in bulk_fields and 'value' in bulk_fields:
                     val = form.cleaned_data.get('value')
                     change_data['value'] = str(val) if isinstance(val, decimal.Decimal) else val
                 if 'productvar' in bulk_fields:

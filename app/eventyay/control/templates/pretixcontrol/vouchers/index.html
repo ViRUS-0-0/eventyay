@@ -248,14 +248,16 @@
                                             </td>
                                         {% endif %}
                                         <td class="list-actions text-right flip">
-                                            <a href="{% url 'control:event.vouchers.bulk_edit' organizer=request.event.organizer.slug event=request.event.slug %}?voucher_group={{ v.pk }}"
-                                               class="btn btn-sm btn-default" title="{% trans 'Edit group' %}" data-toggle="tooltip">
-                                                <i class="fa fa-tag"></i>
-                                            </a>
-                                            <a href="{% url 'control:event.voucher.delete_group' organizer=request.event.organizer.slug event=request.event.slug voucher=v.pk %}"
-                                               class="btn btn-delete btn-danger btn-sm" title="{% trans 'Delete group' %}" data-toggle="tooltip">
-                                                <i class="fa fa-trash"></i>
-                                            </a>
+                                            {% if "can_change_vouchers" in request.eventpermset %}
+                                                <a href="{% url 'control:event.vouchers.bulk_edit' organizer=request.event.organizer.slug event=request.event.slug %}?voucher_group={{ v.pk }}"
+                                                   class="btn btn-sm btn-default" title="{% trans 'Edit group' %}" data-toggle="tooltip">
+                                                    <i class="fa fa-tag"></i>
+                                                </a>
+                                                <a href="{% url 'control:event.voucher.delete_group' organizer=request.event.organizer.slug event=request.event.slug voucher=v.pk %}"
+                                                   class="btn btn-delete btn-danger btn-sm" title="{% trans 'Delete group' %}" data-toggle="tooltip">
+                                                    <i class="fa fa-trash"></i>
+                                                </a>
+                                            {% endif %}
                                         </td>
                                     </tr>
                                 {% else %}
