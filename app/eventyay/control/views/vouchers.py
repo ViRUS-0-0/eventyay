@@ -6,7 +6,7 @@ from django.conf import settings
 from django.contrib import messages
 from django.core.exceptions import ValidationError
 from django.db import connection, transaction
-from django.db.models import Min, Q, Subquery, Sum
+from django.db.models import F, Min, Q, Subquery, Sum
 from django.http import (
     Http404,
     HttpResponse,
@@ -23,6 +23,7 @@ from django.utils.translation import gettext_lazy as _
 from django.views.generic import (
     CreateView,
     DeleteView,
+    FormView,
     ListView,
     UpdateView,
     View,
@@ -34,7 +35,7 @@ from eventyay.base.services.locking import NoLockManager
 from eventyay.base.services.vouchers import vouchers_send
 from eventyay.base.views.tasks import AsyncFormView
 from eventyay.control.forms.filter import VoucherFilterForm, advanced_filter_count, advanced_filters_open_from_get
-from eventyay.control.forms.vouchers import VoucherBulkForm, VoucherForm
+from eventyay.control.forms.vouchers import VoucherBulkForm, VoucherForm, VoucherGroupForm
 from eventyay.control.permissions import EventPermissionRequiredMixin
 from eventyay.control.signals import voucher_form_class
 from eventyay.control.views import PaginationMixin
@@ -272,6 +273,147 @@ class VoucherDelete(EventPermissionRequiredMixin, DeleteView):
                 'organizer': self.request.event.organizer.slug,
                 'event': self.request.event.slug,
             },
+        )
+
+
+def voucher_group_queryset(event, tags=None, ids=None):
+    query = Q()
+    if tags:
+        query |= Q(tag__in=tags)
+    if ids:
+        query |= Q(pk__in=ids)
+    return event.vouchers.filter(query, waitinglistentries__isnull=True).distinct()
+
+
+class VoucherGroupDelete(EventPermissionRequiredMixin, View):
+    permission = 'can_change_vouchers'
+
+    def get_objects(self):
+        try:
+            representative = self.request.event.vouchers.get(pk=self.kwargs['voucher'])
+        except Voucher.DoesNotExist:
+            raise Http404(_('The requested voucher does not exist.'))
+        if not representative.tag:
+            raise Http404(_('The requested voucher does not belong to a group.'))
+        return voucher_group_queryset(self.request.event, tags=[representative.tag]), representative.tag
+
+    def get(self, request, *args, **kwargs):
+        objects, tag = self.get_objects()
+        return render(
+            request,
+            'pretixcontrol/vouchers/delete_group.html',
+            {
+                'group_name': tag,
+                'unused_count': objects.filter(redeemed=0, orderposition__isnull=True).count(),
+                'used_count': objects.exclude(redeemed=0, orderposition__isnull=True).count(),
+            },
+        )
+
+    @transaction.atomic
+    def post(self, request, *args, **kwargs):
+        objects, tag = self.get_objects()
+        for obj in objects.filter(redeemed=0, orderposition__isnull=True).iterator():
+            obj.log_action('eventyay.voucher.deleted', user=request.user)
+            CartPosition.objects.filter(addon_to__voucher=obj).delete()
+            obj.cartposition_set.all().delete()
+            obj.delete()
+        messages.success(request, _('The unused vouchers in group "%s" have been deleted.') % tag)
+        return redirect(self.get_success_url())
+
+    def get_success_url(self):
+        return reverse(
+            'control:event.vouchers',
+            kwargs={'organizer': self.request.event.organizer.slug, 'event': self.request.event.slug},
+        )
+
+
+class VoucherGroupUpdate(EventPermissionRequiredMixin, FormView):
+    permission = 'can_change_vouchers'
+    template_name = 'pretixcontrol/vouchers/group_form.html'
+    form_class = VoucherGroupForm
+
+    def get_objects(self):
+        if self.request.POST.getlist('voucher') or self.request.POST.getlist('voucher_group'):
+            selected_groups = self.request.POST.getlist('voucher_group')
+            tags = self.request.event.vouchers.filter(pk__in=selected_groups).exclude(tag='').values_list('tag', flat=True)
+            return voucher_group_queryset(
+                self.request.event,
+                tags=tags,
+                ids=self.request.POST.getlist('voucher'),
+            )
+        try:
+            representative = self.request.event.vouchers.get(pk=self.kwargs['voucher'])
+        except Voucher.DoesNotExist:
+            raise Http404(_('The requested voucher does not exist.'))
+        if not representative.tag:
+            raise Http404(_('The requested voucher does not belong to a group.'))
+        return voucher_group_queryset(self.request.event, tags=[representative.tag])
+
+    def get_form_kwargs(self):
+        kwargs = super().get_form_kwargs()
+        objects = self.get_objects()
+        kwargs['instance'] = objects.order_by('pk').first()
+        return kwargs
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        context['voucher_ids'] = self.get_objects().values_list('pk', flat=True)
+        context['voucher_codes'] = self.get_objects().order_by('pk').values_list('code', flat=True)
+        return context
+
+    def preview_context(self, form):
+        objects = self.get_objects()
+        changed_max = 'max_usages' in form.changed_data
+        fully_used = objects.filter(redeemed__gte=F('max_usages'))
+        max_too_low = objects.none()
+        if changed_max:
+            max_too_low = objects.filter(redeemed__gt=form.cleaned_data['max_usages'])
+        skipped = objects.filter(
+            Q(redeemed__gte=F('max_usages'))
+            | (Q(redeemed__gt=form.cleaned_data['max_usages']) if changed_max else Q(pk__in=[]))
+        )
+        return {
+            'form': form,
+            'voucher_ids': objects.values_list('pk', flat=True),
+            'voucher_codes': objects.order_by('pk').values_list('code', flat=True),
+            'update_count': objects.exclude(pk__in=skipped).count(),
+            'skip_count': skipped.count(),
+            'fully_used_count': fully_used.count(),
+            'max_too_low_count': max_too_low.exclude(pk__in=fully_used).count(),
+            'preview': True,
+        }
+
+    def form_valid(self, form):
+        if self.request.POST.get('confirm') != 'yes':
+            return render(self.request, self.template_name, self.preview_context(form))
+
+        objects = self.get_objects().select_for_update()
+        changed_data = {field: form.cleaned_data[field] for field in form.changed_data if field != 'productvar'}
+        if 'productvar' in form.changed_data:
+            changed_data.update(
+                product=form.instance.product,
+                variation=form.instance.variation,
+                quota=form.instance.quota,
+            )
+        for obj in objects:
+            if obj.redeemed >= obj.max_usages or (
+                'max_usages' in changed_data and obj.redeemed > changed_data['max_usages']
+            ):
+                continue
+            for field, value in changed_data.items():
+                setattr(obj, field, value)
+            obj.save()
+            if 'productvar' in form.changed_data:
+                obj.limit_products.set(form._limit_products)
+                obj.limit_variations.set(form._limit_variations)
+            obj.log_action('eventyay.voucher.changed', user=self.request.user, data=changed_data)
+        messages.success(self.request, _('The selected vouchers have been updated.'))
+        return redirect(self.get_success_url())
+
+    def get_success_url(self):
+        return reverse(
+            'control:event.vouchers',
+            kwargs={'organizer': self.request.event.organizer.slug, 'event': self.request.event.slug},
         )
 
 
@@ -606,8 +748,29 @@ class VoucherBulkAction(EventPermissionRequiredMixin, View):
                 request,
                 'pretixcontrol/vouchers/delete_bulk.html',
                 {
-                    'allowed': self.objects.filter(redeemed=0, orderposition__isnull=True),
-                    'forbidden': self.objects.exclude(redeemed=0, orderposition__isnull=True),
+                    'allowed_count': self.objects.filter(redeemed=0, orderposition__isnull=True).count(),
+                    'forbidden_count': self.objects.exclude(redeemed=0, orderposition__isnull=True).count(),
+                    'voucher_ids': self.objects.values_list('pk', flat=True),
+                },
+            )
+        elif request.POST.get('action') == 'edit':
+            first = self.objects.order_by('pk').first()
+            form = VoucherGroupForm(instance=first)
+            return render(
+                request,
+                'pretixcontrol/vouchers/group_form.html',
+                {
+                    'form': form,
+                    'voucher_ids': self.objects.values_list('pk', flat=True),
+                    'voucher_codes': self.objects.order_by('pk').values_list('code', flat=True),
+                    'action_url': reverse(
+                        'control:event.voucher.group_edit',
+                        kwargs={
+                            'organizer': request.event.organizer.slug,
+                            'event': request.event.slug,
+                            'voucher': first.pk,
+                        },
+                    ),
                 },
             )
         elif request.POST.get('action') == 'delete_confirm':

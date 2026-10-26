@@ -17,6 +17,12 @@ function groupMemberCheckboxes(table, groupId) {
     return table.querySelectorAll(`[data-voucher-group-member="${groupId}"] input[name="voucher"]`);
 }
 
+function setGroupMemberSelection(table, groupId, checked) {
+    groupMemberCheckboxes(table, groupId).forEach((checkbox) => {
+        checkbox.checked = checked;
+    });
+}
+
 function groupHasMoreMembers(table, groupId) {
     return !!table.querySelector(`${loadMoreRowSelector}[data-voucher-group-load-more="${groupId}"]`);
 }
@@ -96,9 +102,7 @@ function applyGroupSelection(table, groupId) {
         `${groupCheckboxSelector}[data-voucher-group-select="${groupId}"]`
     );
     if (groupCheckbox && groupCheckbox.checked) {
-        groupMemberCheckboxes(table, groupId).forEach((checkbox) => {
-            checkbox.checked = true;
-        });
+        setGroupMemberSelection(table, groupId, true);
     }
 
     const toggle = table.querySelector(`${groupToggleSelector}[data-voucher-group-toggle="${groupId}"]`);
@@ -124,6 +128,12 @@ function insertGroupMembers(table, groupId, html) {
     anchor.insertAdjacentHTML('afterend', html);
     if (existingLoadMoreRow) {
         existingLoadMoreRow.remove();
+    }
+    const groupCheckbox = table.querySelector(
+        `${groupCheckboxSelector}[data-voucher-group-select="${groupId}"]`
+    );
+    if (groupCheckbox?.checked) {
+        setGroupMemberSelection(table, groupId, true);
     }
 }
 
@@ -212,12 +222,29 @@ async function loadMoreMembers(button) {
 function setGroupSelection(groupCheckbox) {
     const table = groupCheckbox.closest(voucherTableSelector);
     const groupId = groupCheckbox.dataset.voucherGroupSelect;
+    if (!table) {
+        return;
+    }
 
     groupCheckbox.indeterminate = false;
-    groupMemberCheckboxes(table, groupId).forEach((memberCheckbox) => {
-        memberCheckbox.checked = groupCheckbox.checked;
-    });
+    setGroupMemberSelection(table, groupId, groupCheckbox.checked);
     updateBatchActions(table);
+
+    if (!groupCheckbox.checked) {
+        return;
+    }
+
+    const group = groupRow(table, groupId);
+    if (!group) {
+        return;
+    }
+
+    loadInitialGroupMembers(group).then((loaded) => {
+        if (loaded && groupCheckbox.checked) {
+            setGroupMemberSelection(table, groupId, true);
+            updateBatchActions(table);
+        }
+    });
 }
 
 function syncMemberGroupCheckbox(memberCheckbox) {
@@ -278,6 +305,12 @@ document.addEventListener('change', (event) => {
         }
     }
 });
+
+document.addEventListener('pointerdown', (event) => {
+    if (event.target instanceof Element && event.target.closest(groupCheckboxSelector)) {
+        event.stopPropagation();
+    }
+}, true);
 
 document.addEventListener('pointerdown', (event) => {
     if (event.target instanceof Element) {
