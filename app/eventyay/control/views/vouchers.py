@@ -277,6 +277,8 @@ class VoucherDelete(EventPermissionRequiredMixin, DeleteView):
 
 
 def voucher_group_queryset(event, tags=None, ids=None):
+    if not tags and not ids:
+        return event.vouchers.none()
     query = Q()
     if tags:
         query |= Q(tag__in=tags)
@@ -352,29 +354,38 @@ class VoucherGroupUpdate(EventPermissionRequiredMixin, FormView):
     def get_form_kwargs(self):
         kwargs = super().get_form_kwargs()
         objects = self.get_objects()
-        kwargs['instance'] = objects.order_by('pk').first()
+        instance = objects.order_by('pk').first()
+        if instance is None:
+            raise Http404(_('The requested vouchers do not exist.'))
+        kwargs['instance'] = instance
         return kwargs
 
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
-        context['voucher_ids'] = self.get_objects().values_list('pk', flat=True)
+        context['selection_voucher_ids'] = self.request.POST.getlist('voucher')
+        context['selection_group_ids'] = self.request.POST.getlist('voucher_group')
         context['voucher_codes'] = self.get_objects().order_by('pk').values_list('code', flat=True)
         return context
 
+    def skipped_objects(self, objects, form):
+        skip_query = Q(redeemed__gte=F('max_usages'))
+        if 'max_usages' in form.changed_data:
+            skip_query |= Q(redeemed__gt=form.cleaned_data['max_usages'])
+        return objects.filter(skip_query)
+
     def preview_context(self, form):
         objects = self.get_objects()
-        changed_max = 'max_usages' in form.changed_data
         fully_used = objects.filter(redeemed__gte=F('max_usages'))
-        max_too_low = objects.none()
-        if changed_max:
-            max_too_low = objects.filter(redeemed__gt=form.cleaned_data['max_usages'])
-        skipped = objects.filter(
-            Q(redeemed__gte=F('max_usages'))
-            | (Q(redeemed__gt=form.cleaned_data['max_usages']) if changed_max else Q(pk__in=[]))
+        max_too_low = (
+            objects.filter(redeemed__gt=form.cleaned_data['max_usages'])
+            if 'max_usages' in form.changed_data
+            else objects.none()
         )
+        skipped = self.skipped_objects(objects, form)
         return {
             'form': form,
-            'voucher_ids': objects.values_list('pk', flat=True),
+            'selection_voucher_ids': self.request.POST.getlist('voucher'),
+            'selection_group_ids': self.request.POST.getlist('voucher_group'),
             'voucher_codes': objects.order_by('pk').values_list('code', flat=True),
             'update_count': objects.exclude(pk__in=skipped).count(),
             'skip_count': skipped.count(),
@@ -387,7 +398,12 @@ class VoucherGroupUpdate(EventPermissionRequiredMixin, FormView):
     def form_valid(self, form):
         object_ids = list(self.get_objects().values_list('pk', flat=True))
         objects = self.request.event.vouchers.filter(pk__in=object_ids).select_for_update()
-        changed_data = {field: form.cleaned_data[field] for field in form.changed_data if field != 'productvar'}
+        skipped = self.skipped_objects(objects, form)
+        changed_data = {
+            field: form.cleaned_data[field]
+            for field in form.changed_data
+            if field not in {'productvar', 'seat'}
+        }
         if 'productvar' in form.changed_data:
             changed_data.update(
                 product=form.instance.product,
@@ -395,12 +411,9 @@ class VoucherGroupUpdate(EventPermissionRequiredMixin, FormView):
                 quota=form.instance.quota,
             )
         updated_count = 0
-        skipped_count = 0
+        skipped_ids = set(skipped.values_list('pk', flat=True))
         for obj in objects:
-            if obj.redeemed >= obj.max_usages or (
-                'max_usages' in changed_data and obj.redeemed > changed_data['max_usages']
-            ):
-                skipped_count += 1
+            if obj.pk in skipped_ids:
                 continue
             for field, value in changed_data.items():
                 setattr(obj, field, value)
@@ -414,7 +427,7 @@ class VoucherGroupUpdate(EventPermissionRequiredMixin, FormView):
             self.request,
             _('Updated %(updated)s vouchers. Skipped %(skipped)s vouchers.') % {
                 'updated': updated_count,
-                'skipped': skipped_count,
+                'skipped': len(skipped_ids),
             },
         )
         return redirect(self.get_success_url())
@@ -770,7 +783,8 @@ class VoucherBulkAction(EventPermissionRequiredMixin, View):
                 'pretixcontrol/vouchers/group_form.html',
                 {
                     'form': form,
-                    'voucher_ids': self.objects.values_list('pk', flat=True),
+                    'selection_voucher_ids': request.POST.getlist('voucher'),
+                    'selection_group_ids': request.POST.getlist('voucher_group'),
                     'voucher_codes': self.objects.order_by('pk').values_list('code', flat=True),
                     'action_url': reverse(
                         'control:event.voucher.group_edit',
