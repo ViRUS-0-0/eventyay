@@ -383,11 +383,10 @@ class VoucherGroupUpdate(EventPermissionRequiredMixin, FormView):
             'preview': True,
         }
 
+    @transaction.atomic
     def form_valid(self, form):
-        if self.request.POST.get('confirm') != 'yes':
-            return render(self.request, self.template_name, self.preview_context(form))
-
-        objects = self.get_objects().select_for_update()
+        object_ids = list(self.get_objects().values_list('pk', flat=True))
+        objects = self.request.event.vouchers.filter(pk__in=object_ids).select_for_update()
         changed_data = {field: form.cleaned_data[field] for field in form.changed_data if field != 'productvar'}
         if 'productvar' in form.changed_data:
             changed_data.update(
@@ -395,10 +394,13 @@ class VoucherGroupUpdate(EventPermissionRequiredMixin, FormView):
                 variation=form.instance.variation,
                 quota=form.instance.quota,
             )
+        updated_count = 0
+        skipped_count = 0
         for obj in objects:
             if obj.redeemed >= obj.max_usages or (
                 'max_usages' in changed_data and obj.redeemed > changed_data['max_usages']
             ):
+                skipped_count += 1
                 continue
             for field, value in changed_data.items():
                 setattr(obj, field, value)
@@ -407,7 +409,14 @@ class VoucherGroupUpdate(EventPermissionRequiredMixin, FormView):
                 obj.limit_products.set(form._limit_products)
                 obj.limit_variations.set(form._limit_variations)
             obj.log_action('eventyay.voucher.changed', user=self.request.user, data=changed_data)
-        messages.success(self.request, _('The selected vouchers have been updated.'))
+            updated_count += 1
+        messages.success(
+            self.request,
+            _('Updated %(updated)s vouchers. Skipped %(skipped)s vouchers.') % {
+                'updated': updated_count,
+                'skipped': skipped_count,
+            },
+        )
         return redirect(self.get_success_url())
 
     def get_success_url(self):
