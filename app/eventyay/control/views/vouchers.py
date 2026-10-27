@@ -16,6 +16,7 @@ from django.http import (
 )
 from django.shortcuts import redirect, render
 from django.urls import resolve, reverse
+from django.utils import timezone
 from django.utils.functional import cached_property
 from django.utils.html import format_html
 from django.utils.safestring import mark_safe
@@ -371,34 +372,101 @@ class VoucherGroupUpdate(EventPermissionRequiredMixin, FormView):
         skip_query = Q(redeemed__gte=F('max_usages'))
         if 'max_usages' in form.changed_data:
             skip_query |= Q(redeemed__gt=form.cleaned_data['max_usages'])
-        return objects.filter(skip_query)
+        if hasattr(objects, 'filter'):
+            return objects.filter(skip_query)
+        return [obj for obj in objects if obj.redeemed >= obj.max_usages or (
+            'max_usages' in form.changed_data and obj.redeemed > form.cleaned_data['max_usages']
+        )]
+
+    def skipped_object_ids(self, objects, form):
+        skipped = self.skipped_objects(objects, form)
+        skipped_ids = {obj.pk for obj in skipped}
+        reasons = {
+            'fully_used': 0,
+            'max_too_low': 0,
+            'seat_incompatible': 0,
+        }
+        for obj in objects:
+            if obj.pk in skipped_ids:
+                if obj.redeemed >= obj.max_usages:
+                    reasons['fully_used'] += 1
+                elif 'max_usages' in form.changed_data:
+                    reasons['max_too_low'] += 1
+        if 'productvar' in form.changed_data:
+            for obj in objects:
+                if (
+                    obj.pk not in skipped_ids
+                    and obj.seat_id
+                    and (not form.instance.product_id or obj.seat.product_id != form.instance.product_id)
+                ):
+                    skipped_ids.add(obj.pk)
+                    reasons['seat_incompatible'] += 1
+        return skipped_ids, reasons
+
+    def validate_quota_delta(self, objects, form):
+        if not form.cleaned_data.get('block_quota') or form.cleaned_data.get('allow_ignore_quota'):
+            return
+        now = timezone.now()
+        valid_until = form.cleaned_data.get('valid_until')
+        if valid_until is not None and valid_until < now:
+            return
+        delta = 0
+        reservation_changed = bool({'productvar', 'subevent'} & set(form.changed_data))
+        for obj in objects:
+            was_blocking = obj.block_quota and (obj.valid_until is None or obj.valid_until >= now)
+            if was_blocking:
+                if reservation_changed or (obj.valid_until is not None and obj.valid_until < now):
+                    delta += form.cleaned_data['max_usages']
+                elif 'max_usages' in form.changed_data:
+                    delta += max(0, form.cleaned_data['max_usages'] - obj.max_usages)
+            else:
+                delta += form.cleaned_data['max_usages']
+        if delta:
+            Voucher.clean_quota_check(
+                form.cleaned_data,
+                delta,
+                None,
+                self.request.event,
+                form.instance.quota,
+                form.instance.product,
+                form.instance.variation,
+                limit_products=getattr(form, '_limit_products', []),
+                limit_variations=getattr(form, '_limit_variations', []),
+            )
 
     def preview_context(self, form):
-        objects = self.get_objects()
-        fully_used = objects.filter(redeemed__gte=F('max_usages'))
-        max_too_low = (
-            objects.filter(redeemed__gt=form.cleaned_data['max_usages'])
-            if 'max_usages' in form.changed_data
-            else objects.none()
-        )
-        skipped = self.skipped_objects(objects, form)
+        objects = list(self.get_objects().select_related('seat'))
+        skipped_ids, reasons = self.skipped_object_ids(objects, form)
         return {
             'form': form,
             'selection_voucher_ids': self.request.POST.getlist('voucher'),
             'selection_group_ids': self.request.POST.getlist('voucher_group'),
-            'voucher_codes': objects.order_by('pk').values_list('code', flat=True),
-            'update_count': objects.exclude(pk__in=skipped).count(),
-            'skip_count': skipped.count(),
-            'fully_used_count': fully_used.count(),
-            'max_too_low_count': max_too_low.exclude(pk__in=fully_used).count(),
+            'voucher_codes': [obj.code for obj in objects],
+            'update_count': len(objects) - len(skipped_ids),
+            'skip_count': len(skipped_ids),
+            'fully_used_count': reasons['fully_used'],
+            'max_too_low_count': reasons['max_too_low'],
+            'seat_incompatible_count': reasons['seat_incompatible'],
             'preview': True,
         }
 
     @transaction.atomic
     def form_valid(self, form):
         object_ids = list(self.get_objects().values_list('pk', flat=True))
-        objects = self.request.event.vouchers.filter(pk__in=object_ids).select_for_update()
-        skipped = self.skipped_objects(objects, form)
+        objects = list(
+            self.request.event.vouchers.filter(pk__in=object_ids)
+            .select_related('seat')
+            .select_for_update()
+        )
+        if self.request.POST.get('confirm') != '1':
+            return self.render_to_response(self.preview_context(form))
+        skipped_ids, _ = self.skipped_object_ids(objects, form)
+        eligible_objects = [obj for obj in objects if obj.pk not in skipped_ids]
+        try:
+            self.validate_quota_delta(eligible_objects, form)
+        except ValidationError as exc:
+            form.add_error(None, exc)
+            return self.form_invalid(form)
         changed_data = {
             field: form.cleaned_data[field]
             for field in form.changed_data
@@ -411,7 +479,6 @@ class VoucherGroupUpdate(EventPermissionRequiredMixin, FormView):
                 quota=form.instance.quota,
             )
         updated_count = 0
-        skipped_ids = set(skipped.values_list('pk', flat=True))
         for obj in objects:
             if obj.pk in skipped_ids:
                 continue
