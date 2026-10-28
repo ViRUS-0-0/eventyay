@@ -112,7 +112,7 @@
     {% eventsignal request.event 'eventyay.control.signals.voucher_form_html' form=form %}
     <div class='form-group submit-group'>
       <a href="{% url 'control:event.vouchers' organizer=request.event.organizer.slug event=request.event.slug %}" class='btn btn-default btn-cancel'>{% trans 'Cancel' %}</a>
-      <button type='submit' name='confirm' value='1' class='btn btn-primary btn-save'>
+      <button type='submit'{% if preview %} name='confirm' value='1'{% endif %} class='btn btn-primary btn-save'>
         {% if preview %}{% trans 'Confirm and save' %}{% else %}{% trans 'Review changes' %}{% endif %}
       </button>
     </div>

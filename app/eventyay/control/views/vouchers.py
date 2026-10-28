@@ -404,23 +404,31 @@ class VoucherGroupUpdate(EventPermissionRequiredMixin, FormView):
         return skipped_ids, reasons
 
     def validate_quota_delta(self, objects, form):
-        if not form.cleaned_data.get('block_quota') or form.cleaned_data.get('allow_ignore_quota'):
-            return
         now = timezone.now()
-        valid_until = form.cleaned_data.get('valid_until')
-        if valid_until is not None and valid_until < now:
-            return
         delta = 0
-        reservation_changed = bool({'productvar', 'subevent'} & set(form.changed_data))
         for obj in objects:
-            was_blocking = obj.block_quota and (obj.valid_until is None or obj.valid_until >= now)
-            if was_blocking:
-                if reservation_changed or (obj.valid_until is not None and obj.valid_until < now):
-                    delta += form.cleaned_data['max_usages']
-                elif 'max_usages' in form.changed_data:
-                    delta += max(0, form.cleaned_data['max_usages'] - obj.max_usages)
-            else:
-                delta += form.cleaned_data['max_usages']
+            block_quota = (
+                form.cleaned_data['block_quota'] if 'block_quota' in form.changed_data else obj.block_quota
+            )
+            allow_ignore_quota = (
+                form.cleaned_data['allow_ignore_quota']
+                if 'allow_ignore_quota' in form.changed_data
+                else obj.allow_ignore_quota
+            )
+            valid_until = (
+                form.cleaned_data['valid_until'] if 'valid_until' in form.changed_data else obj.valid_until
+            )
+            max_usages = form.cleaned_data['max_usages'] if 'max_usages' in form.changed_data else obj.max_usages
+            was_reserving = obj.block_quota and not obj.allow_ignore_quota and (
+                obj.valid_until is None or obj.valid_until >= now
+            )
+            will_reserve = block_quota and not allow_ignore_quota and (
+                valid_until is None or valid_until >= now
+            )
+            if not was_reserving and will_reserve:
+                delta += max_usages
+            elif was_reserving and will_reserve and 'max_usages' in form.changed_data:
+                delta += max(0, max_usages - obj.max_usages)
         if delta:
             Voucher.clean_quota_check(
                 form.cleaned_data,
@@ -460,7 +468,7 @@ class VoucherGroupUpdate(EventPermissionRequiredMixin, FormView):
         )
         if self.request.POST.get('confirm') != '1':
             return self.render_to_response(self.preview_context(form))
-        skipped_ids, _ = self.skipped_object_ids(objects, form)
+        skipped_ids, _skipped_reasons = self.skipped_object_ids(objects, form)
         eligible_objects = [obj for obj in objects if obj.pk not in skipped_ids]
         try:
             self.validate_quota_delta(eligible_objects, form)
