@@ -30,7 +30,7 @@ from django.views.generic import (
     View,
 )
 
-from eventyay.base.models import CartPosition, LogEntry, Voucher
+from eventyay.base.models import CartPosition, LogEntry, Quota, Voucher
 from eventyay.base.models.vouchers import _generate_random_code
 from eventyay.base.services.locking import NoLockManager
 from eventyay.base.services.vouchers import vouchers_send
@@ -405,42 +405,83 @@ class VoucherGroupUpdate(EventPermissionRequiredMixin, FormView):
 
     def validate_quota_delta(self, objects, form):
         now = timezone.now()
-        delta = 0
+        quota_delta = {}
+
+        def add_targets(targets, amount):
+            for target in targets:
+                quota_delta[target] = quota_delta.get(target, 0) + amount
+
+        def targets_for(voucher, *, new=False):
+            if new:
+                block_quota = form.cleaned_data['block_quota'] if 'block_quota' in form.changed_data else voucher.block_quota
+                allow_ignore_quota = (
+                    form.cleaned_data['allow_ignore_quota']
+                    if 'allow_ignore_quota' in form.changed_data
+                    else voucher.allow_ignore_quota
+                )
+                valid_until = (
+                    form.cleaned_data['valid_until'] if 'valid_until' in form.changed_data else voucher.valid_until
+                )
+                subevent = form.cleaned_data['subevent'] if 'subevent' in form.changed_data else voucher.subevent
+                quota = form.instance.quota if 'productvar' in form.changed_data else voucher.quota
+                product = form.instance.product if 'productvar' in form.changed_data else voucher.product
+                variation = form.instance.variation if 'productvar' in form.changed_data else voucher.variation
+                limit_products = (
+                    getattr(form, '_limit_products', [])
+                    if 'productvar' in form.changed_data
+                    else voucher.limit_products.all()
+                )
+                limit_variations = (
+                    getattr(form, '_limit_variations', [])
+                    if 'productvar' in form.changed_data
+                    else voucher.limit_variations.all()
+                )
+                if not block_quota or allow_ignore_quota or (valid_until is not None and valid_until < now):
+                    return set()
+            else:
+                if not voucher.block_quota or voucher.allow_ignore_quota or (
+                    voucher.valid_until is not None and voucher.valid_until < now
+                ):
+                    return set()
+                subevent = voucher.subevent
+                quota = voucher.quota
+                product = voucher.product
+                variation = voucher.variation
+                limit_products = voucher.limit_products.all()
+                limit_variations = voucher.limit_variations.all()
+            if quota:
+                return {quota}
+            targets = set(limit_variations)
+            targets.update(p for p in limit_products if not p.has_variations)
+            if variation:
+                targets.add(variation)
+            elif product and not product.has_variations:
+                targets.add(product)
+            return {
+                quota
+                for target in targets
+                for quota in target.quotas.filter(subevent=subevent)
+            }
+
         for obj in objects:
-            block_quota = (
-                form.cleaned_data['block_quota'] if 'block_quota' in form.changed_data else obj.block_quota
-            )
-            allow_ignore_quota = (
-                form.cleaned_data['allow_ignore_quota']
-                if 'allow_ignore_quota' in form.changed_data
-                else obj.allow_ignore_quota
-            )
-            valid_until = (
-                form.cleaned_data['valid_until'] if 'valid_until' in form.changed_data else obj.valid_until
-            )
             max_usages = form.cleaned_data['max_usages'] if 'max_usages' in form.changed_data else obj.max_usages
-            was_reserving = obj.block_quota and not obj.allow_ignore_quota and (
-                obj.valid_until is None or obj.valid_until >= now
-            )
-            will_reserve = block_quota and not allow_ignore_quota and (
-                valid_until is None or valid_until >= now
-            )
-            if not was_reserving and will_reserve:
-                delta += max_usages
-            elif was_reserving and will_reserve and 'max_usages' in form.changed_data:
-                delta += max(0, max_usages - obj.max_usages)
-        if delta:
-            Voucher.clean_quota_check(
-                form.cleaned_data,
-                delta,
-                None,
-                self.request.event,
-                form.instance.quota,
-                form.instance.product,
-                form.instance.variation,
-                limit_products=getattr(form, '_limit_products', []),
-                limit_variations=getattr(form, '_limit_variations', []),
-            )
+            remaining_old = max(0, obj.max_usages - obj.redeemed)
+            remaining_new = max(0, max_usages - obj.redeemed)
+            add_targets(targets_for(obj), -remaining_old)
+            add_targets(targets_for(obj, new=True), remaining_new)
+        for quota, delta in quota_delta.items():
+            if delta <= 0:
+                continue
+            availability = quota.availability(count_waitinglist=False)
+            if availability[0] != Quota.AVAILABILITY_OK or (
+                availability[1] is not None and availability[1] < delta
+            ):
+                raise ValidationError(
+                    _(
+                        'You cannot create a voucher that blocks quota as the selected product or '
+                        'quota is currently sold out or completely reserved.'
+                    )
+                )
 
     def preview_context(self, form):
         objects = list(self.get_objects().select_related('seat'))
