@@ -21,6 +21,36 @@ function setGroupMemberSelection(table, groupId, checked) {
     groupMemberCheckboxes(table, groupId).forEach((checkbox) => {
         checkbox.checked = checked;
     });
+    const form = table.closest('form');
+    form?.querySelectorAll(`input[name="voucher_exclude"][data-voucher-group-exclude="${groupId}"]`).forEach((input) => {
+        input.remove();
+    });
+}
+
+function syncGroupExclusions(table, groupId) {
+    const form = table.closest('form');
+    if (!form) {
+        return;
+    }
+    form.querySelectorAll(`input[name="voucher_exclude"][data-voucher-group-exclude="${groupId}"]`).forEach((input) => {
+        input.remove();
+    });
+    const groupCheckbox = table.querySelector(
+        `${groupCheckboxSelector}[data-voucher-group-select="${groupId}"]`
+    );
+    if (!groupCheckbox?.checked) {
+        return;
+    }
+    groupMemberCheckboxes(table, groupId).forEach((checkbox) => {
+        if (!checkbox.checked) {
+            const input = document.createElement('input');
+            input.type = 'hidden';
+            input.name = 'voucher_exclude';
+            input.value = checkbox.value;
+            input.dataset.voucherGroupExclude = groupId;
+            form.appendChild(input);
+        }
+    });
 }
 
 function groupHasMoreMembers(table, groupId) {
@@ -63,15 +93,22 @@ function syncGroupCheckbox(groupCheckbox) {
     } else if (groupCheckbox.checked && checkedCount === memberCheckboxes.length) {
         groupCheckbox.indeterminate = false;
     } else if (checkedCount === 0) {
-        groupCheckbox.checked = false;
-        groupCheckbox.indeterminate = false;
-    } else if (!groupHasMoreMembers(table, groupId) && checkedCount === memberCheckboxes.length) {
+        if (!groupHasMoreMembers(table, groupId)) {
+            groupCheckbox.checked = false;
+            groupCheckbox.indeterminate = false;
+        } else {
+            groupCheckbox.indeterminate = true;
+        }
+    } else if (checkedCount < memberCheckboxes.length) {
+        groupCheckbox.checked = true;
+        groupCheckbox.indeterminate = true;
+    } else if (!groupHasMoreMembers(table, groupId)) {
         groupCheckbox.checked = true;
         groupCheckbox.indeterminate = false;
     } else {
-        groupCheckbox.checked = false;
-        groupCheckbox.indeterminate = true;
+        groupCheckbox.indeterminate = false;
     }
+    syncGroupExclusions(table, groupId);
 }
 
 function syncGroupCheckboxes(table) {
