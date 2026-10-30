@@ -538,7 +538,6 @@ class VoucherGroupUpdate(EventPermissionRequiredMixin, FormView):
         object_ids = list(self.get_objects().values_list('pk', flat=True))
         objects = list(
             self.request.event.vouchers.filter(pk__in=object_ids)
-            .select_related('seat')
             .prefetch_related('limit_products', 'limit_variations')
             .select_for_update()
         )
