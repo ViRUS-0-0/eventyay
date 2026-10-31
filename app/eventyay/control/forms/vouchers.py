@@ -386,6 +386,10 @@ class VoucherForm(I18nModelForm):
 class VoucherGroupForm(VoucherForm):
     allow_reduced_max_usages = True
 
+    def __init__(self, *args, mixed_fields=None, **kwargs):
+        self.mixed_fields = set(mixed_fields or ())
+        super().__init__(*args, **kwargs)
+
     class Meta:
         model = Voucher
         localized_fields = '__all__'

@@ -289,6 +289,42 @@ def voucher_group_queryset(event, tags=None, ids=None):
     return event.vouchers.filter(query, waitinglistentries__isnull=True).distinct()
 
 
+def voucher_group_mixed_fields(objects, instance):
+    mixed_fields = {
+        field
+        for field in (
+            'tag',
+            'valid_until',
+            'block_quota',
+            'allow_ignore_quota',
+            'allow_ignore_approval',
+            'value',
+            'max_usages',
+            'price_mode',
+            'subevent',
+            'show_hidden_products',
+            'all_addons_included',
+            'all_bundles_included',
+            'budget',
+            'comment',
+        )
+        if objects.exclude(**{field: getattr(instance, field)}).exists()
+    }
+    product_values = {
+        (
+            voucher.quota_id,
+            voucher.product_id,
+            voucher.variation_id,
+            tuple(voucher.limit_products.values_list('pk', flat=True)),
+            tuple(voucher.limit_variations.values_list('pk', flat=True)),
+        )
+        for voucher in objects
+    }
+    if len(product_values) > 1:
+        mixed_fields.add('productvar')
+    return mixed_fields
+
+
 class VoucherGroupDelete(EventPermissionRequiredMixin, View):
     permission = 'can_change_vouchers'
 
@@ -373,6 +409,9 @@ class VoucherGroupUpdate(EventPermissionRequiredMixin, FormView):
         if instance is None:
             raise Http404(_('The requested vouchers do not exist.'))
         kwargs['instance'] = instance
+        mixed_fields = voucher_group_mixed_fields(objects, instance)
+        kwargs['mixed_fields'] = mixed_fields
+        kwargs.setdefault('initial', {}).update({field: None for field in mixed_fields})
         return kwargs
 
     def get_context_data(self, **kwargs):
@@ -381,23 +420,30 @@ class VoucherGroupUpdate(EventPermissionRequiredMixin, FormView):
         context['selection_group_ids'] = self.request.POST.getlist('voucher_group')
         context['selection_excluded_voucher_ids'] = self.request.POST.getlist('voucher_exclude')
         context['voucher_codes'] = self.get_objects().order_by('pk').values_list('code', flat=True)
+        context['mixed_fields'] = getattr(context['form'], 'mixed_fields', set())
         return context
 
     def get_changed_fields(self, objects, form):
         changed_fields = set(form.changed_data) - {'seat'}
-        scalar_fields = set(form.cleaned_data) - {'productvar', 'seat'}
+        for field in form.mixed_fields:
+            if not form.cleaned_data.get(field):
+                changed_fields.discard(field)
+        scalar_fields = set(form.cleaned_data) - {'productvar', 'seat'} - form.mixed_fields
+        scalar_fields.update(field for field in form.mixed_fields if form.cleaned_data.get(field))
         for field in scalar_fields:
             if any(getattr(obj, field, None) != form.cleaned_data[field] for obj in objects):
                 changed_fields.add(field)
-        if any(
+        if 'productvar' not in form.mixed_fields or form.cleaned_data.get('productvar'):
+            product_changed = any(
             obj.quota_id != form.instance.quota_id
             or obj.product_id != form.instance.product_id
             or obj.variation_id != form.instance.variation_id
             or {p.pk for p in obj.limit_products.all()} != {p.pk for p in form._limit_products}
             or {v.pk for v in obj.limit_variations.all()} != {v.pk for v in form._limit_variations}
             for obj in objects
-        ):
-            changed_fields.add('productvar')
+            )
+            if product_changed:
+                changed_fields.add('productvar')
         return changed_fields
 
     def skipped_objects(self, objects, form, changed_fields):
@@ -944,7 +990,11 @@ class VoucherBulkAction(EventPermissionRequiredMixin, View):
             for receiver, response in voucher_form_class.send(request.event, cls=form_class):
                 if response:
                     form_class = response
-            form = form_class(instance=first)
+            form = form_class(
+                instance=first,
+                mixed_fields=voucher_group_mixed_fields(self.objects, first),
+                initial={field: None for field in voucher_group_mixed_fields(self.objects, first)},
+            )
             return render(
                 request,
                 'pretixcontrol/vouchers/group_form.html',
@@ -953,6 +1003,7 @@ class VoucherBulkAction(EventPermissionRequiredMixin, View):
                     'selection_voucher_ids': request.POST.getlist('voucher'),
                     'selection_group_ids': request.POST.getlist('voucher_group'),
                     'selection_excluded_voucher_ids': request.POST.getlist('voucher_exclude'),
+                    'mixed_fields': form.mixed_fields,
                     'voucher_codes': self.objects.order_by('pk').values_list('code', flat=True),
                     'action_url': reverse(
                         'control:event.voucher.group_edit',

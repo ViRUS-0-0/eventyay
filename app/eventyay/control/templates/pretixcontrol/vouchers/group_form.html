@@ -14,6 +14,11 @@
     {% for voucher_id in selection_voucher_ids %}<input type='hidden' name='voucher' value='{{ voucher_id }}'>{% endfor %}
     {% for group_id in selection_group_ids %}<input type='hidden' name='voucher_group' value='{{ group_id }}'>{% endfor %}
     {% for voucher_id in selection_excluded_voucher_ids %}<input type='hidden' name='voucher_exclude' value='{{ voucher_id }}'>{% endfor %}
+    {% if mixed_fields %}
+      <div class='alert alert-info'>
+        {% trans 'Fields with different values are left blank. Leave them blank to keep each voucher’s current value, or enter a value to apply it to all selected vouchers.' %}
+      </div>
+    {% endif %}
     {% if preview %}
       <div class='alert alert-warning'>
         <p>

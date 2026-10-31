@@ -818,6 +818,40 @@ class VoucherFormTest(SoupTestMixin, TransactionTestCase):
                 object_id__in=[first.pk, second.pk],
             ).count() == 2
 
+    def test_group_edit_keeps_mixed_tags_when_expiry_changes(self):
+        expiry = now() + datetime.timedelta(days=10)
+        with scopes_disabled():
+            first = self.event.vouchers.create(
+                code='TAGONE',
+                tag='first-group',
+                product=self.ticket,
+                allow_ignore_quota=True,
+            )
+            second = self.event.vouchers.create(
+                code='TAGTWO',
+                tag='second-group',
+                product=self.ticket,
+                allow_ignore_quota=True,
+            )
+        url = '/control/event/%s/%s/vouchers/%s/group_edit' % (self.orga.slug, self.event.slug, first.pk)
+        doc = self.get_doc(url)
+        form_data = extract_form_fields(doc.select('.container-fluid form')[0])
+        form_data.update(
+            {
+                'voucher_group': [first.pk, second.pk],
+                'valid_until_0': expiry.strftime('%Y-%m-%d'),
+                'valid_until_1': expiry.strftime('%H:%M:%S'),
+            }
+        )
+        preview = self.post_doc(url, form_data)
+        assert '2 vouchers will be updated' in preview.text
+        form_data['confirm'] = '1'
+        self.post_doc(url, form_data)
+        with scopes_disabled():
+            assert self.event.vouchers.get(pk=first.pk).tag == 'first-group'
+            assert self.event.vouchers.get(pk=second.pk).tag == 'second-group'
+            assert self.event.vouchers.filter(pk__in=[first.pk, second.pk], valid_until=expiry).count() == 2
+
     def test_subevent_optional(self):
         self.event.has_subevents = True
         self.event.save()
